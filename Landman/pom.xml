@@ -9,20 +9,14 @@
     <properties>
         <maven.compiler.source>17</maven.compiler.source>
         <maven.compiler.target>17</maven.compiler.target>
-        <selenium.version>4.11.0</selenium.version>
+        <selenium.version>4.40.0</selenium.version>
     </properties>
     <dependencies>
-<!-- Source: https://mvnrepository.com/artifact/org.seleniumhq.selenium/selenium-chrome-driver -->
-<dependency>
-    <groupId>org.seleniumhq.selenium</groupId>
-    <artifactId>selenium-chrome-driver</artifactId>
-    <version>4.40.0</version>
-    <scope>compile</scope>
-</dependency>
+<!-- Use a single, consistent Selenium 4.x dependency to avoid API/runtime conflicts -->
 <dependency>
     <groupId>org.seleniumhq.selenium</groupId>
     <artifactId>selenium-java</artifactId>
-    <version>3.141.0</version>
+    <version>${selenium.version}</version>
 </dependency>
     </dependencies>
 </project>

@@ -11,6 +11,7 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 import org.openqa.selenium.By;
+import org.openqa.selenium.JavascriptExecutor;
 import org.openqa.selenium.WebDriver;
 import org.openqa.selenium.WebElement;
 import org.openqa.selenium.support.ui.WebDriverWait;
@@ -31,13 +32,15 @@ import org.openqa.selenium.support.ui.ExpectedConditions;
 public class TruePeopleSearchScraper {
 
     public static class PersonContact {
+        public String detailUrl;
         public final List<String> phones = new ArrayList<>();
         public final List<String> emails = new ArrayList<>();
-        
+
         //TODO: These results should be feed to an Excel file or database instead of just printed. Add methods to export to CSV or Excel.
         @Override
         public String toString() {
             StringBuilder sb = new StringBuilder();
+            sb.append("Detail URL: ").append(detailUrl).append("\n");
             sb.append("Phones:\n");
             for (String p : phones) sb.append("  ").append(p).append("\n");
             sb.append("Emails:\n");
@@ -63,48 +66,63 @@ public class TruePeopleSearchScraper {
     public static PersonContact search(WebDriver driver, String name, String address) throws Exception {
         PersonContact result = new PersonContact();
 
+
         String encodedName = URLEncoder.encode(name, StandardCharsets.UTF_8.toString());
         String encodedAddr = URLEncoder.encode(address, StandardCharsets.UTF_8.toString());
         String url = "https://www.truepeoplesearch.com/results?name=" + encodedName + "&citystatezip=" + encodedAddr;
 
         driver.get(url);
 
-        // Wait briefly for the page to load (presence of body). Caller controls timeouts via driver config.
+        // Cloudflare Turnstile challenge intercepts automated requests.
+        // We must wait for the challenge to complete and the real page to load.
+        // The real page will contain elements with data-detail-link attributes.
+        System.out.println("Waiting for Cloudflare challenge to complete...");
         try {
-            WebDriverWait wait = new WebDriverWait(driver, Duration.ofSeconds(10));
-            wait.until(new ExpectedCondition<Boolean>() {
+            WebDriverWait challengeWait = new WebDriverWait(driver, Duration.ofSeconds(45));
+            challengeWait.until(new ExpectedCondition<Boolean>() {
                 @Override
                 public Boolean apply(WebDriver d) {
-                    return d.getPageSource() != null && d.getPageSource().length() > 0;
+                    // If Cloudflare Turnstile is present, the page will contain
+                    // "cf-turnstile-response" and NOT have the real content yet.
+                    // We wait until real content appears (or the challenge div disappears).
+                    String src = (String) ((JavascriptExecutor) d).executeScript(
+                            "return document.documentElement.outerHTML;");
+                    if (src == null) return false;
+                    // The real page has search result cards with data-detail-link
+                    // or at minimum does NOT have the challenge widget as the main content.
+                    boolean hasChallengeOnly = src.contains("cf-turnstile-response")
+                            && !src.contains("data-detail-link");
+                    return !hasChallengeOnly && src.contains("data-detail-link");
                 }
             });
+            System.out.println("Cloudflare challenge passed.");
         } catch (Exception ex) {
-        	 System.out.println("An error occurred: " + ex.getMessage());
+            System.out.println("Cloudflare challenge may not have completed: " + ex.getMessage());
+            System.out.println("Current URL: " + driver.getCurrentUrl());
         }
 
-        String html = driver.getPageSource();
+        // Use JavascriptExecutor to get the live rendered DOM
+        JavascriptExecutor js = (JavascriptExecutor) driver;
+        String html = (String) js.executeScript("return document.documentElement.outerHTML;");
         if (html == null) html = "";
 
-        // For debugging: print all links on the page to see if working (can be removed in production)
         System.out.println("URL: " + driver.getCurrentUrl());
-        System.out.println("Page Source: " + driver.getPageSource());
-        
-//      String ariaLabelText = "View All Details";
-//      String cssSelector = String.format("[aria-label='%s']", ariaLabelText);
-//      List<WebElement> allLinks = driver.findElements(By.cssSelector(cssSelector));
+
+        // Find the first result card and extract its data-detail-link attribute
         try {
-			 WebDriverWait wait = new WebDriverWait(driver, Duration.ofSeconds(30));
-			 WebElement linkElement = wait.until(ExpectedConditions.presenceOfElementLocated(By.cssSelector(".card.card-body.shadow-form.card-summary.pt-3")));
-			 
-		     List<WebElement> allLinks = linkElement.findElements(By.cssSelector("a"));
-		     System.out.println("Found " + allLinks.size() + " links on the page.");
-		      for(WebElement link : allLinks) {
-		        System.out.println("Link text: " + link.getText() + " | href: " + link.getAttribute("href") + " | Label: " + link.getAttribute("aria-label"));
-		      }
-		} catch (Exception ex) {
-			System.out.println("URL: " + driver.getCurrentUrl());
-			System.out.println("An error occurred while waiting for the element: " + ex.getMessage());
-		}
+            WebDriverWait wait = new WebDriverWait(driver, Duration.ofSeconds(10));
+            WebElement firstCard = wait.until(ExpectedConditions.presenceOfElementLocated(
+                    By.cssSelector("[data-detail-link]")));
+
+            String detailPath = firstCard.getAttribute("data-detail-link");
+            if (detailPath != null && !detailPath.isEmpty()) {
+                result.detailUrl = "https://www.truepeoplesearch.com" + detailPath;
+                System.out.println("Detail URL: " + result.detailUrl);
+            }
+        } catch (Exception ex) {
+            System.out.println("URL: " + driver.getCurrentUrl());
+            System.out.println("An error occurred while finding the detail link: " + ex.getMessage());
+        }
 
         
         // Find phone numbers
