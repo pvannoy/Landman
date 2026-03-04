@@ -1,114 +1,141 @@
 package com.landman;
 
-import java.io.IOException;
-import java.util.Scanner;
-import org.openqa.selenium.WebDriver;
-import org.openqa.selenium.chrome.ChromeDriver;
-import org.openqa.selenium.chrome.ChromeOptions;
+import com.microsoft.playwright.Playwright;
+import org.apache.poi.ss.usermodel.*;
+import org.apache.poi.xssf.usermodel.XSSFWorkbook;
+
+import java.io.*;
+import java.nio.file.Paths;
 
 /**
- * Simple main program that starts a clean Chrome instance via remote debugging,
- * attaches Selenium to it, calls the scraper, and prints the discovered results.
- *
- * This approach launches Chrome as a normal user process (no Selenium automation
- * flags) and then connects to it via the Chrome DevTools Protocol debugging port.
- * Cloudflare Turnstile sees a regular browser, not an automated one.
+ * Main program that reads an Excel file (default: data.xlsx) containing columns
+ * Name, City, and St, searches TruePeopleSearch for each row, and writes the
+ * results (phones_tps, emails_tps) to found_data.xlsx.
  *
  * Usage:
- *   java -cp "&lt;classpath&gt;" com.landman.Main "John Doe" "City, ST"
+ *   java -cp "<classpath>" com.landman.Main [filename] [delay]
  *
- * If no command-line arguments are provided, the program will prompt for name and address.
- * TODO: Add ability to import a list of name/address pairs from an Excel or CSV file.
+ *   filename – Excel file to process (default: data.xlsx)
+ *   delay    – seconds to sleep between searches (default: 5)
  */
 public class Main {
 
-    private static final int DEBUG_PORT = 9222;
-
     public static void main(String[] args) {
-        String name;
-        String address;
-        if (args.length >= 2) {
-            name = args[0];
-            address = args[1];
-        } else {
-            Scanner s = new Scanner(System.in);
-            System.out.print("Enter full name to search: ");
-            name = s.nextLine().trim();
-            System.out.print("Enter city/state/zip (or address): ");
-            address = s.nextLine().trim();
-            s.close();
-        }
+        String filename = args.length >= 1 ? args[0] : "data.xlsx";
+        int delay = args.length >= 2 ? Integer.parseInt(args[1]) : 5;
 
-        if (name.isEmpty() || address.isEmpty()) {
-            System.err.println("Name and address are required.");
-            System.exit(2);
-        }
+        String inputPath = Paths.get(System.getProperty("user.dir"), filename).toString();
+        String outputPath = Paths.get(System.getProperty("user.dir"), "found_data.xlsx").toString();
 
-        // ── Step 1: Launch Chrome as a normal process with remote debugging ──
-        // This creates an ordinary Chrome window with ZERO Selenium/automation
-        // fingerprints.  We use a dedicated user-data-dir so it doesn't collide
-        // with any Chrome instance you already have open.
-        Process chromeProcess = null;
-        WebDriver driver = null;
-        try {
-            String chromePath = findChromePath();
-            String userDataDir = System.getProperty("java.io.tmpdir") + "landman_chrome_profile";
+        System.out.println("Reading input file: " + inputPath);
 
-            System.out.println("Launching Chrome with remote debugging on port " + DEBUG_PORT + " ...");
-            chromeProcess = new ProcessBuilder(
-                    chromePath,
-                    "--remote-debugging-port=" + DEBUG_PORT,
-                    "--user-data-dir=" + userDataDir,
-                    "--no-first-run",
-                    "--no-default-browser-check",
-                    "--start-maximized"
-            ).start();
+        try (FileInputStream fis = new FileInputStream(inputPath);
+             Workbook workbook = new XSSFWorkbook(fis);
+             Playwright playwright = Playwright.create()) {
 
-            // Give Chrome a moment to start and open the debugging port
-            Thread.sleep(3000);
+            Sheet sheet = workbook.getSheetAt(0);
+            Row headerRow = sheet.getRow(0);
 
-            // ── Step 2: Attach Selenium to the running Chrome via debuggerAddress ──
-            ChromeOptions options = new ChromeOptions();
-            options.setExperimentalOption("debuggerAddress", "localhost:" + DEBUG_PORT);
+            // ── Locate required columns by name ──────────────────────────────
+            int nameCol = -1, cityCol = -1, stCol = -1;
+            int phonesTpsCol = -1, emailsTpsCol = -1;
+            int lastCol = headerRow.getLastCellNum();
 
-            driver = new ChromeDriver(options);
-
-            System.out.println("Connected to Chrome. Running search...");
-            TruePeopleSearchScraper.PersonContact contact =
-                    TruePeopleSearchScraper.search(driver, name, address);
-            System.out.println("Search results for: " + name + " | " + address);
-            System.out.println(contact);
-        } catch (Throwable t) {
-            System.err.println("Error while running scraper: " + t.getMessage());
-            t.printStackTrace(System.err);
-        } finally {
-            // Disconnect Selenium (does NOT close Chrome since we didn't launch it via Selenium)
-            if (driver != null) {
-                try { driver.quit(); } catch (Exception e) { /* ignore */ }
+            for (int c = 0; c < lastCol; c++) {
+                Cell cell = headerRow.getCell(c);
+                if (cell == null) continue;
+                String header = cell.getStringCellValue().trim();
+                switch (header) {
+                    case "Name" -> nameCol = c;
+                    case "City" -> cityCol = c;
+                    case "St" -> stCol = c;
+                    case "phones_tps" -> phonesTpsCol = c;
+                    case "emails_tps" -> emailsTpsCol = c;
+                }
             }
-            // Kill the Chrome process we launched
-            if (chromeProcess != null) {
-                chromeProcess.destroyForcibly();
+
+            if (nameCol == -1 || cityCol == -1 || stCol == -1) {
+                System.err.println("ERROR: Excel file must have columns: Name, City, St");
+                System.exit(2);
             }
+
+            // Add output columns if they don't exist yet
+            if (phonesTpsCol == -1) {
+                phonesTpsCol = lastCol;
+                headerRow.createCell(phonesTpsCol).setCellValue("phones_tps");
+                lastCol++;
+            }
+            if (emailsTpsCol == -1) {
+                emailsTpsCol = lastCol;
+                headerRow.createCell(emailsTpsCol).setCellValue("emails_tps");
+            }
+
+            // ── Process each data row ────────────────────────────────────────
+            int totalRows = sheet.getLastRowNum(); // 0-based index of last row
+            for (int r = 1; r <= totalRows; r++) {
+                Row row = sheet.getRow(r);
+                if (row == null) continue;
+
+                String name = getCellString(row.getCell(nameCol));
+                String city = getCellString(row.getCell(cityCol));
+                String state = getCellString(row.getCell(stCol));
+
+                if (name.isEmpty() || city.isEmpty() || state.isEmpty()) {
+                    System.out.println("Skipping row " + r + " (missing data)");
+                    continue;
+                }
+
+                System.out.println("Searching for: " + name + ", " + city + ", " + state);
+                System.out.println("Searching in TruePeopleSearch...");
+
+                TruePeopleSearchScraper.PersonContact contact =
+                        TruePeopleSearchScraper.search(playwright, name, city, state);
+
+                String phonesStr = String.join("\n", contact.phones);
+                String emailsStr = String.join("\n", contact.emails);
+
+                getOrCreateCell(row, phonesTpsCol).setCellValue(phonesStr);
+                getOrCreateCell(row, emailsTpsCol).setCellValue(emailsStr);
+
+                System.out.println("Found phones(tps): " + contact.phones);
+                System.out.println("Found emails(tps): " + contact.emails);
+
+                System.out.println("Sleeping for " + delay + " seconds...");
+                Thread.sleep(delay * 1000L);
+                System.out.println("--------------------");
+            }
+
+            // ── Write output ─────────────────────────────────────────────────
+            try (FileOutputStream fos = new FileOutputStream(outputPath)) {
+                workbook.write(fos);
+            }
+            System.out.println("Results written to: " + outputPath);
+
+        } catch (FileNotFoundException e) {
+            System.err.println("File not found: " + inputPath);
+            System.exit(1);
+        } catch (Exception e) {
+            System.err.println("Error: " + e.getMessage());
+            e.printStackTrace(System.err);
+            System.exit(1);
         }
     }
 
-    /**
-     * Locate the Chrome executable on this system.
-     * Checks common Windows install paths; extend as needed for macOS / Linux.
-     */
-    private static String findChromePath() {
-        String[] candidates = {
-                System.getenv("ProgramFiles") + "\\Google\\Chrome\\Application\\chrome.exe",
-                System.getenv("ProgramFiles(x86)") + "\\Google\\Chrome\\Application\\chrome.exe",
-                System.getenv("LOCALAPPDATA") + "\\Google\\Chrome\\Application\\chrome.exe",
+    /** Safely read a cell value as a trimmed String. */
+    private static String getCellString(Cell cell) {
+        if (cell == null) return "";
+        return switch (cell.getCellType()) {
+            case STRING -> cell.getStringCellValue().trim();
+            case NUMERIC -> String.valueOf((long) cell.getNumericCellValue());
+            case BOOLEAN -> String.valueOf(cell.getBooleanCellValue());
+            default -> "";
         };
-        for (String path : candidates) {
-            if (path != null && new java.io.File(path).exists()) {
-                return path;
-            }
-        }
-        // Fallback: assume it's on the PATH
-        return "chrome";
+    }
+
+    /** Get or create a cell at the given column index. */
+    private static Cell getOrCreateCell(Row row, int col) {
+        Cell cell = row.getCell(col);
+        if (cell == null) cell = row.createCell(col);
+        return cell;
     }
 }
