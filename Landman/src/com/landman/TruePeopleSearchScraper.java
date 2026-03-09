@@ -1,8 +1,11 @@
 package com.landman;
 
-import org.openqa.selenium.*;
-import org.openqa.selenium.firefox.FirefoxDriver;
-import org.openqa.selenium.firefox.FirefoxOptions;
+import com.microsoft.playwright.*;
+import com.microsoft.playwright.options.Proxy;
+import org.jsoup.Jsoup;
+import org.jsoup.nodes.Document;
+import org.jsoup.nodes.Element;
+import org.jsoup.select.Elements;
 
 import java.util.*;
 import java.util.regex.Matcher;
@@ -12,7 +15,7 @@ import java.util.regex.Pattern;
  * Scraper that queries truepeoplesearch.com for a name + city/state and
  * extracts phone numbers and email addresses from the detail pages.
  *
- * Uses Selenium with Firefox and a rotating proxy to bypass Cloudflare.
+ * Uses Playwright with Firefox and a rotating proxy to bypass Cloudflare.
  */
 public class TruePeopleSearchScraper {
 
@@ -20,8 +23,7 @@ public class TruePeopleSearchScraper {
     private static final int MAX_RETRIES = 7;
 
     // Proxy configuration
-    private static final String PROXY_HOST = "usa.rotating.proxyrack.net";
-    private static final int PROXY_PORT = 9000;
+    private static final String PROXY_SERVER = "http://usa.rotating.proxyrack.net:9000";
     private static final String PROXY_USERNAME = "lylleryals11";
     private static final String PROXY_PASSWORD = "5cbb55-0fe3ef-e78508-6f475b-ce994a";
 
@@ -48,6 +50,9 @@ public class TruePeopleSearchScraper {
         }
     }
 
+    // Track whether the proxy is working; if not, skip it on future attempts
+    private static boolean proxyFailed = false;
+
     /**
      * Search TruePeopleSearch for the given name and city/state.
      *
@@ -57,60 +62,72 @@ public class TruePeopleSearchScraper {
      * @return PersonContact with discovered phones and emails
      */
     public static PersonContact search(String name, String city, String state) {
+        // Prevent Playwright from re-downloading browsers on every Playwright.create()
+        System.setProperty("PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD", "1");
+
         PersonContact result = new PersonContact();
         List<String> resultLinks = new ArrayList<>();
 
         // ── Step 1: Search page – fill form, get result links ──────────────
         for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
-            WebDriver driver = null;
-            try {
-                driver = createDriver();
-                driver.get(BASE_LINK);
+            try (Playwright playwright = Playwright.create()) {
+                Browser browser = launchFirefox(playwright, attempt);
+                BrowserContext context = browser.newContext();
+                Page page = context.newPage();
 
-                String title = driver.getTitle();
-                if (title.contains("Just a moment...") || title.contains("Attention Required!")) {
-                    System.out.println("  Cloudflare challenge detected (attempt " + (attempt + 1) + "), retrying...");
-                    continue;
-                }
+                try {
+                    page.navigate(BASE_LINK, new Page.NavigateOptions()
+                            .setWaitUntil(com.microsoft.playwright.options.WaitUntilState.DOMCONTENTLOADED)
+                            .setTimeout(60000));
 
-                // Wait a moment for the page to settle
-                Thread.sleep(3000);
+                    String title = page.title();
+                    if (title.contains("Just a moment...") || title.contains("Attention Required!")) {
+                        System.out.println("  Cloudflare challenge detected (attempt " + (attempt + 1) + "), retrying...");
+                        browser.close();
+                        continue;
+                    }
 
-                // Fill in search form fields
-                driver.findElement(By.id("id-d-n")).clear();
-                driver.findElement(By.id("id-d-n")).sendKeys(name);
+                    // Wait a moment for the page to settle
+                    page.waitForTimeout(3000);
 
-                driver.findElement(By.id("id-d-loc-name")).clear();
-                driver.findElement(By.id("id-d-loc-name")).sendKeys(city + "," + state);
+                    // Fill in search form fields
+                    page.fill("#id-d-n", name);
+                    page.fill("#id-d-loc-name", city + "," + state);
+                    page.click("#btnSubmit-d-n");
 
-                driver.findElement(By.id("btnSubmit-d-n")).click();
+                    // Wait for results to load
+                    page.waitForTimeout(5000);
 
-                // Wait for results to load
-                Thread.sleep(5000);
+                    // Get page content and parse with Jsoup
+                    String html = page.content();
+                    Document doc = Jsoup.parse(html);
 
-                // Parse result cards that match the target city/state
-                List<WebElement> cards = driver.findElements(
-                        By.cssSelector("div.card.card-body.shadow-form.card-summary.pt-3"));
+                    // Find all result cards with data-detail-link attributes
+                    Elements cards = doc.select("div.card.card-body.shadow-form.card-summary.pt-3");
 
-                String cityState = city + ", " + state;
-                for (WebElement card : cards) {
-                    String text = card.getText();
-                    if (text != null && text.contains(cityState)) {
-                        String detailLink = card.getAttribute("data-detail-link");
-                        if (detailLink != null && !detailLink.isEmpty()) {
-                            resultLinks.add(BASE_LINK + detailLink);
+                    String cityState = city + ", " + state;
+                    for (Element card : cards) {
+                        String text = card.text();
+                        if (text != null && text.contains(cityState)) {
+                            String detailLink = card.attr("data-detail-link");
+                            if (detailLink != null && !detailLink.isEmpty()) {
+                                resultLinks.add(BASE_LINK + detailLink);
+                            }
                         }
                     }
-                }
 
-                System.out.println("  Was found persons: " + resultLinks.size());
-                break; // success
+                    System.out.println("  Was found persons: " + resultLinks.size());
+                    browser.close();
+                    break; // success
 
-            } catch (Exception ex) {
-                System.out.println("  Error on search attempt " + (attempt + 1) + ": " + ex.getMessage());
-            } finally {
-                if (driver != null) {
-                    driver.quit();
+                } catch (Exception ex) {
+                    String msg = ex.getMessage();
+                    System.out.println("  Error on search attempt " + (attempt + 1) + ": " + msg);
+                    if (msg != null && msg.contains("PROXY_CONNECTION_REFUSED")) {
+                        proxyFailed = true;
+                        System.out.println("  Proxy appears down, switching to direct connection...");
+                    }
+                    browser.close();
                 }
             }
         }
@@ -121,46 +138,58 @@ public class TruePeopleSearchScraper {
 
         for (String link : resultLinks) {
             for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
-                WebDriver driver = null;
-                try {
-                    driver = createDriver();
-                    driver.get(link);
+                try (Playwright playwright = Playwright.create()) {
+                    Browser browser = launchFirefox(playwright, attempt);
+                    BrowserContext context = browser.newContext();
+                    Page page = context.newPage();
 
-                    String title = driver.getTitle();
-                    if (title.contains("Just a moment...") || title.contains("Attention Required!")) {
-                        System.out.println("  Cloudflare challenge on detail page (attempt "
-                                + (attempt + 1) + "), retrying...");
-                        continue;
-                    }
+                    try {
+                        page.navigate(link, new Page.NavigateOptions()
+                                .setWaitUntil(com.microsoft.playwright.options.WaitUntilState.DOMCONTENTLOADED)
+                                .setTimeout(60000));
 
-                    // Wait for page to settle
-                    Thread.sleep(3000);
-
-                    // Get the visible text of the page
-                    String pageText = driver.findElement(By.tagName("body")).getText();
-
-                    // Extract phone numbers
-                    Matcher pm = PHONE_PATTERN.matcher(pageText);
-                    while (pm.find()) {
-                        foundPhones.add(pm.group());
-                    }
-
-                    // Extract emails (exclude support email)
-                    Matcher em = EMAIL_PATTERN.matcher(pageText);
-                    while (em.find()) {
-                        String email = em.group();
-                        if (!"support@truepeoplesearch.com".equalsIgnoreCase(email)) {
-                            foundEmails.add(email);
+                        String title = page.title();
+                        if (title.contains("Just a moment...") || title.contains("Attention Required!")) {
+                            System.out.println("  Cloudflare challenge on detail page (attempt "
+                                    + (attempt + 1) + "), retrying...");
+                            browser.close();
+                            continue;
                         }
-                    }
 
-                    break; // success
+                        // Wait for page to settle
+                        page.waitForTimeout(3000);
 
-                } catch (Exception ex) {
-                    System.out.println("  Error on detail attempt " + (attempt + 1) + ": " + ex.getMessage());
-                } finally {
-                    if (driver != null) {
-                        driver.quit();
+                        // Get the full HTML and parse with Jsoup
+                        String html = page.content();
+                        Document doc = Jsoup.parse(html);
+                        String pageText = doc.body().text();
+
+                        // Extract phone numbers
+                        Matcher pm = PHONE_PATTERN.matcher(pageText);
+                        while (pm.find()) {
+                            foundPhones.add(pm.group());
+                        }
+
+                        // Extract emails (exclude support email)
+                        Matcher em = EMAIL_PATTERN.matcher(pageText);
+                        while (em.find()) {
+                            String email = em.group();
+                            if (!"support@truepeoplesearch.com".equalsIgnoreCase(email)) {
+                                foundEmails.add(email);
+                            }
+                        }
+
+                        browser.close();
+                        break; // success
+
+                    } catch (Exception ex) {
+                        String msg = ex.getMessage();
+                        System.out.println("  Error on detail attempt " + (attempt + 1) + ": " + msg);
+                        if (msg != null && msg.contains("PROXY_CONNECTION_REFUSED")) {
+                            proxyFailed = true;
+                            System.out.println("  Proxy appears down, switching to direct connection...");
+                        }
+                        browser.close();
                     }
                 }
             }
@@ -172,25 +201,23 @@ public class TruePeopleSearchScraper {
     }
 
     /**
-     * Create a headless Firefox WebDriver with the rotating proxy.
+     * Launch Firefox with proxy if available, or without proxy as fallback.
+     * First attempt always tries the proxy; if proxy has been flagged as failed
+     * we go direct immediately.
      */
-    private static WebDriver createDriver() {
-        FirefoxOptions options = new FirefoxOptions();
-        options.addArguments("--headless");
+    private static Browser launchFirefox(Playwright playwright, int attempt) {
+        BrowserType.LaunchOptions opts = new BrowserType.LaunchOptions()
+                .setHeadless(true);
 
-        // Configure proxy via Firefox preferences (supports authenticated proxies)
-        options.addPreference("network.proxy.type", 1);
-        options.addPreference("network.proxy.ssl", PROXY_HOST);
-        options.addPreference("network.proxy.ssl_port", PROXY_PORT);
-        options.addPreference("network.proxy.http", PROXY_HOST);
-        options.addPreference("network.proxy.http_port", PROXY_PORT);
+        if (!proxyFailed) {
+            opts.setProxy(new Proxy(PROXY_SERVER)
+                    .setUsername(PROXY_USERNAME)
+                    .setPassword(PROXY_PASSWORD));
+            System.out.println("  Launching Firefox with proxy (attempt " + (attempt + 1) + ")");
+        } else {
+            System.out.println("  Launching Firefox without proxy (attempt " + (attempt + 1) + ")");
+        }
 
-        // Set proxy authentication via URL-embedded credentials in the SOCKS config,
-        // or use an extension. For basic auth proxies with Firefox/Selenium, the
-        // simplest approach is to set the credentials via a profile preference:
-        options.addPreference("network.proxy.socks_username", PROXY_USERNAME);
-        options.addPreference("network.proxy.socks_password", PROXY_PASSWORD);
-
-        return new FirefoxDriver(options);
+        return playwright.firefox().launch(opts);
     }
 }
