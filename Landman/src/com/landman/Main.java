@@ -52,6 +52,9 @@ public class Main {
         System.out.println("Selected file: " + inputPath);
         System.out.println("Output will be written to: " + outputPath);
 
+        // ── Initialize the shared browser session (solve CAPTCHAs once) ─────
+        TruePeopleSearchScraper.initialize();
+
         // ── Process the Excel file ───────────────────────────────────────────
         try (FileInputStream fis = new FileInputStream(inputPath);
              Workbook workbook = new XSSFWorkbook(fis)) {
@@ -66,18 +69,18 @@ public class Main {
             for (int r = 0; r <= sheet.getLastRowNum(); r++) {
                 Row candidate = sheet.getRow(r);
                 if (candidate == null) continue;
-                
+
                 //TODO: Make the switch case-insensitive and ignore whitespace in header matching
                 for (int c = 0; c < candidate.getLastCellNum(); c++) {
                     Cell cell = candidate.getCell(c);
                     if (cell == null || cell.getCellType() != CellType.STRING) continue;
-                    String header = cell.getStringCellValue().trim();
+                    String header = cell.getStringCellValue().trim().toLowerCase();
                     switch (header) {
-                        case "Name" -> nameCol = c;
-                        case "City" -> cityCol = c;
-                        case "ST" -> stCol = c;
-                        case "Phone" -> phonesTpsCol = c;
-                        case "Email" -> emailsTpsCol = c;
+                        case "name" -> nameCol = c;
+                        case "city" -> cityCol = c;
+                        case "st","state" -> stCol = c;
+                        case "phone" -> phonesTpsCol = c;
+                        case "email" -> emailsTpsCol = c;
                     }
                 }
 
@@ -176,6 +179,8 @@ public class Main {
                     "Error: " + e.getMessage(),
                     "Error", JOptionPane.ERROR_MESSAGE);
             System.exit(1);
+        } finally {
+            TruePeopleSearchScraper.shutdown();
         }
     }
 
