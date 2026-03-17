@@ -7,6 +7,7 @@ import javax.swing.*;
 import javax.swing.filechooser.FileNameExtensionFilter;
 import java.io.*;
 import java.nio.file.Paths;
+import java.util.Random;
 
 /**
  * Main program that prompts the user to select an Excel file via a file explorer
@@ -151,8 +152,13 @@ public class Main {
                 System.out.println("Found phones(tps): " + contact.phones);
                 System.out.println("Found emails(tps): " + contact.emails);
 
-                System.out.println("Sleeping for " + delay + " seconds...");
-                Thread.sleep(delay * 1000L);
+                // Randomize delay between searches (±50% jitter around base)
+                // Fixed intervals are a strong bot signal
+                Random rng = new Random();
+                int jitteredDelay = (int) (delay * (0.5 + rng.nextDouble() * 1.0));
+                jitteredDelay = Math.max(2, jitteredDelay); // at least 2 seconds
+                System.out.println("Sleeping for " + jitteredDelay + " seconds...");
+                Thread.sleep(jitteredDelay * 1000L);
                 System.out.println("--------------------");
             }
 

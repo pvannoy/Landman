@@ -1,15 +1,13 @@
 package com.landman;
 
-import com.microsoft.playwright.*;
-import com.microsoft.playwright.options.WaitUntilState;
 import org.jsoup.Jsoup;
 import org.jsoup.nodes.Document;
 import org.jsoup.nodes.Element;
 import org.jsoup.select.Elements;
 
-import com.google.gson.JsonArray;
-import com.google.gson.JsonObject;
-
+import java.io.IOException;
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -18,352 +16,401 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * Scraper that queries truepeoplesearch.com for a name + city/state and
- * extracts phone numbers and email addresses from the detail pages.
+ * Scraper for truepeoplesearch.com.
  *
- * Launches real Chrome (not Playwright's Chromium) with remote debugging,
- * then connects via CDP. This avoids all Playwright automation flags that
- * anti-bot systems detect.
+ * Strategy: Launch a real Chrome process via ProcessBuilder, then control it
+ * via raw CDP (WebSocket) — NO Playwright in the loop at all.  DataDome sees
+ * zero automation libraries.  This is identical to what happens when a user
+ * opens Chrome DevTools (F12) — the same WebSocket protocol.
+ *
+ * Proxy auth is handled by LocalProxyForwarder on localhost.
+ * Search is done by filling the homepage form + clicking submit, not by
+ * navigating directly to /results (which is a bot signal).
  */
 public class TruePeopleSearchScraper {
 
     private static final String BASE_LINK = "https://www.truepeoplesearch.com/";
 
-    // ── Proxy configuration ──────────────────────────────────────────────
+    // -- Proxy configuration --
     private static final boolean USE_PROXY = true;
-    private static final String PROXY_SERVER = "premium.residential.proxyrack.net:9000";
+    private static final String PROXY_HOST = "premium.residential.proxyrack.net";
+    private static final int PROXY_PORT = 9000;
     private static final String PROXY_USERNAME = "gefabebibozasu-country-US";
     private static final String PROXY_PASSWORD = "TJEZYCE-6CBC90A-NUMCLFK-QVADQS7-7YK3VAU-UCFS8QQ-PCHOUQJ";
-
-    private static final int CDP_PORT = 9222;
+    private static final int LOCAL_PROXY_PORT = 18090;
 
     private static final Pattern PHONE_PATTERN = Pattern.compile("\\(\\d{3}\\) \\d{3}-\\d{4}");
     private static final Pattern EMAIL_PATTERN = Pattern.compile(
             "\\b[A-Za-z0-9._%+\\-]+@[A-Za-z0-9.\\-]+\\.[A-Za-z]{2,}\\b");
-    private static final Random RANDOM = new Random();
+    private static final Random RNG = new Random();
 
-    // Persistent profile so cookies/CAPTCHA tokens survive across runs
     private static final String PROFILE_DIR =
             Paths.get(System.getProperty("user.home"), ".landman-browser-profile").toString();
+    private static final Path FLAGGED_MARKER =
+            Paths.get(PROFILE_DIR, ".flagged");
 
-    // ── Shared browser session ──────────────────────────────────────────────
-    private static Playwright playwright;
-    private static Browser browser;
-    private static BrowserContext context;
-    private static Page page;
-    private static CDPSession cdpSession;
-    private static Process chromeProcess;
+    private static final int[][] VIEWPORT_SIZES = {
+            {1920, 1080}, {1536, 864}, {1440, 900}, {1366, 768},
+            {1280, 720}, {1600, 900}, {1680, 1050}, {1920, 1200}
+    };
+
+    // -- Session state --
+    private static ChromeLauncher chromeLauncher;
+    private static LocalProxyForwarder proxyForwarder;
+    private static RawCdpClient cdp;
     private static boolean initialized = false;
+    private static int viewportWidth;
+    private static int viewportHeight;
+    private static String lastProxyIp = "";
+    private static boolean homepageVisited = false;
 
     public static class PersonContact {
         public final List<String> phones = new ArrayList<>();
         public final List<String> emails = new ArrayList<>();
     }
 
-    /**
-     * Find Chrome executable on the system.
-     */
-    private static String findChrome() {
-        String[] candidates = {
-                "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
-                "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
-                System.getenv("LOCALAPPDATA") + "\\Google\\Chrome\\Application\\chrome.exe"
-        };
-        for (String path : candidates) {
-            if (path != null && Files.exists(Path.of(path))) return path;
-        }
-        throw new RuntimeException("Chrome not found. Please install Google Chrome.");
-    }
+    // ===================================================================
+    //  Lifecycle
+    // ===================================================================
 
-    /**
-     * Set up CDP-level proxy authentication. This intercepts 407 challenges
-     * and provides credentials directly via the DevTools protocol — no
-     * extensions needed.
-     */
-    private static void setupCDPProxyAuth(Page pg) {
-        try {
-            cdpSession = context.newCDPSession(pg);
-
-            // Register event handlers BEFORE enabling Fetch
-            // so we don't miss any events
-
-            // Handle proxy 407 auth challenges with our credentials
-            cdpSession.on("Fetch.authRequired", event -> {
-                try {
-                    JsonObject ev = (JsonObject) event;
-                    String requestId = ev.get("requestId").getAsString();
-                    System.out.println("  [CDP] Auth challenge received, providing credentials...");
-
-                    JsonObject authResponse = new JsonObject();
-                    authResponse.addProperty("response", "ProvideCredentials");
-                    authResponse.addProperty("username", PROXY_USERNAME);
-                    authResponse.addProperty("password", PROXY_PASSWORD);
-
-                    JsonObject params = new JsonObject();
-                    params.addProperty("requestId", requestId);
-                    params.add("authChallengeResponse", authResponse);
-
-                    cdpSession.send("Fetch.continueWithAuth", params);
-                } catch (Exception e) {
-                    System.out.println("  CDP proxy auth error: " + e.getMessage());
-                }
-            });
-
-            // Every intercepted request must be resumed immediately
-            cdpSession.on("Fetch.requestPaused", event -> {
-                try {
-                    JsonObject ev = (JsonObject) event;
-                    String requestId = ev.get("requestId").getAsString();
-
-                    JsonObject params = new JsonObject();
-                    params.addProperty("requestId", requestId);
-                    cdpSession.send("Fetch.continueRequest", params);
-                } catch (Exception e) {
-                    // ignore — request may already have been handled
-                }
-            });
-
-            // Now enable Fetch — intercept ALL requests so auth events fire
-            JsonObject fetchParams = new JsonObject();
-            fetchParams.addProperty("handleAuthRequests", true);
-            // No patterns = all requests are intercepted (required for auth to work)
-            cdpSession.send("Fetch.enable", fetchParams);
-
-            System.out.println("  CDP proxy auth handler installed");
-        } catch (Exception e) {
-            System.out.println("  WARNING: Could not set up CDP proxy auth: " + e.getMessage());
-            System.out.println("  You may need to enter proxy credentials manually in the browser.");
-        }
-    }
-
-    /**
-     * Launch real Chrome with remote debugging and proxy, then connect via CDP.
-     * This avoids all Playwright automation flags that anti-bot systems detect.
-     */
-    public static void initialize() {
-        System.setProperty("PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD", "1");
-
-        // Kill any Chrome already using our debug port
-        try {
-            new ProcessBuilder("cmd", "/c",
-                    "for /f \"tokens=5\" %a in ('netstat -aon ^| findstr :" + CDP_PORT + "') do taskkill /F /PID %a")
-                    .start().waitFor();
-        } catch (Exception ignored) {}
-
-        // Build Chrome command line — NO automation flags at all
-        List<String> chromeArgs = new ArrayList<>(List.of(
-                findChrome(),
-                "--remote-debugging-port=" + CDP_PORT,
-                "--user-data-dir=" + PROFILE_DIR,
-                "--no-first-run",
-                "--no-default-browser-check",
-                "--window-size=1920,1080",
-                "--start-maximized"
-        ));
-
-        if (USE_PROXY) {
-            chromeArgs.add("--proxy-server=http://" + PROXY_SERVER);
-            System.out.println("  Proxy enabled: " + PROXY_SERVER);
-        }
-
-        System.out.println("  Browser profile: " + PROFILE_DIR);
-        System.out.println("  Launching Chrome with CDP on port " + CDP_PORT + "...");
-
-        try {
-            chromeProcess = new ProcessBuilder(chromeArgs)
-                    .redirectErrorStream(true)
-                    .start();
-
-            // Give Chrome time to start and open the debug port
-            Thread.sleep(3000);
-        } catch (Exception e) {
-            throw new RuntimeException("Failed to launch Chrome: " + e.getMessage(), e);
-        }
-
-        // Connect Playwright to the real Chrome via CDP
-        playwright = Playwright.create();
-        browser = playwright.chromium().connectOverCDP("http://localhost:" + CDP_PORT);
-
-        List<BrowserContext> contexts = browser.contexts();
-        context = contexts.isEmpty() ? browser.newContext() : contexts.get(0);
-
-        List<Page> pages = context.pages();
-        page = pages.isEmpty() ? context.newPage() : pages.get(0);
-
-        // Set up CDP proxy auth BEFORE navigating
-        if (USE_PROXY && !PROXY_USERNAME.isEmpty()) {
-            setupCDPProxyAuth(page);
-        }
-
-        // Navigate to homepage
-        System.out.println("  Opening TruePeopleSearch...");
-        page.navigate(BASE_LINK, new Page.NavigateOptions()
-                .setWaitUntil(WaitUntilState.DOMCONTENTLOADED)
-                .setTimeout(60000));
-
-        // Wait for Cloudflare and any CAPTCHAs to be solved
-        waitForHumanVerification(page, "homepage");
-
-        // Disable CDP Fetch interception now that proxy credentials are cached.
-        // Keeping Fetch active changes network timing in ways anti-bot detects.
-        if (cdpSession != null) {
+    private static void clearFlaggedProfile() {
+        if (Files.exists(FLAGGED_MARKER)) {
+            System.out.println("  Browser profile was flagged - clearing for fresh start...");
             try {
-                cdpSession.send("Fetch.disable");
-                System.out.println("  CDP Fetch disabled (proxy credentials cached)");
-            } catch (Exception ignored) {}
+                Path profilePath = Path.of(PROFILE_DIR);
+                if (Files.exists(profilePath)) {
+                    Files.walk(profilePath)
+                            .sorted(Comparator.reverseOrder())
+                            .forEach(p -> {
+                                try { Files.deleteIfExists(p); } catch (IOException ignored) {}
+                            });
+                }
+                System.out.println("  Profile cleared.");
+            } catch (IOException e) {
+                System.out.println("  WARNING: Could not fully clear profile: " + e.getMessage());
+            }
         }
-
-        System.out.println("  Browser session ready: " + page.title());
-        initialized = true;
     }
 
-    /**
-     * Shut down the shared browser session.
-     */
+    private static void markProfileFlagged() {
+        try {
+            Files.createDirectories(Path.of(PROFILE_DIR));
+            Files.writeString(FLAGGED_MARKER, "flagged");
+        } catch (IOException ignored) {}
+    }
+
+    /** Called once from Main.java. */
+    public static void initialize() {
+        clearFlaggedProfile();
+
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            try { shutdown(); } catch (Exception ignored) {}
+        }));
+
+        launchAndConnect();
+    }
+
+    private static void launchAndConnect() {
+        int[] vp = VIEWPORT_SIZES[RNG.nextInt(VIEWPORT_SIZES.length)];
+        viewportWidth = vp[0];
+        viewportHeight = vp[1];
+
+        // 1. Start local proxy forwarder
+        if (USE_PROXY && proxyForwarder == null) {
+            try {
+                proxyForwarder = new LocalProxyForwarder(
+                        LOCAL_PROXY_PORT, PROXY_HOST, PROXY_PORT,
+                        PROXY_USERNAME, PROXY_PASSWORD);
+                proxyForwarder.start();
+            } catch (IOException e) {
+                System.out.println("  WARNING: Could not start proxy forwarder: " + e.getMessage());
+            }
+        }
+
+        // 2. Launch real Chrome
+        try {
+            chromeLauncher = new ChromeLauncher();
+            String proxyAddr = USE_PROXY ? "http://localhost:" + LOCAL_PROXY_PORT : null;
+
+            System.out.println("  Launching real Chrome (no automation libraries)...");
+            System.out.println("  Profile: " + PROFILE_DIR);
+            System.out.println("  Viewport: " + viewportWidth + "x" + viewportHeight);
+            if (USE_PROXY) {
+                System.out.println("  Proxy: localhost:" + LOCAL_PROXY_PORT
+                        + " -> " + PROXY_HOST + ":" + PROXY_PORT);
+            }
+
+            chromeLauncher.launch(PROFILE_DIR, proxyAddr, viewportWidth, viewportHeight);
+            chromeLauncher.waitForReady(15000);
+        } catch (IOException e) {
+            System.out.println("  ERROR: Failed to launch Chrome: " + e.getMessage());
+            throw new RuntimeException("Chrome launch failed", e);
+        }
+
+        // 3. Connect raw CDP WebSocket (NO Playwright)
+        try {
+            System.out.println("  Connecting via raw CDP WebSocket (no Playwright)...");
+            cdp = new RawCdpClient(chromeLauncher.getDebugPort());
+            cdp.connect();
+            System.out.println("  CDP connected.");
+        } catch (Exception e) {
+            System.out.println("  ERROR: CDP connection failed: " + e.getMessage());
+            throw new RuntimeException("CDP connection failed", e);
+        }
+
+        // 4. Verify proxy
+        if (USE_PROXY) {
+            verifyProxy();
+        }
+
+        System.out.println("  Browser session ready.");
+        initialized = true;
+        homepageVisited = false;
+    }
+
+    private static void verifyProxy() {
+        try {
+            System.out.println("  Verifying proxy IP...");
+            cdp.navigate("https://api.ipify.org/?format=text", 30000);
+            sleep(2000);
+            String ip = cdp.getBodyText().trim();
+            System.out.println("  External IP (should be proxy, NOT your real IP): " + ip);
+            if (!ip.isEmpty() && ip.equals(lastProxyIp)) {
+                System.out.println("  WARNING: Proxy IP has NOT changed from last session!");
+            }
+            lastProxyIp = ip;
+        } catch (Exception e) {
+            System.out.println("  WARNING: Could not verify proxy IP: " + e.getMessage());
+        }
+    }
+
     public static void shutdown() {
-        try {
-            if (cdpSession != null) cdpSession.detach();
-        } catch (Exception ignored) {}
-        try {
-            if (browser != null) browser.close();
-        } catch (Exception ignored) {}
-        try {
-            if (playwright != null) playwright.close();
-        } catch (Exception ignored) {}
-        try {
-            if (chromeProcess != null && chromeProcess.isAlive()) chromeProcess.destroyForcibly();
-        } catch (Exception ignored) {}
-        page = null;
-        context = null;
-        browser = null;
-        cdpSession = null;
-        playwright = null;
-        chromeProcess = null;
+        if (cdp != null) {
+            try { cdp.close(); } catch (Exception ignored) {}
+            cdp = null;
+        }
+        if (chromeLauncher != null) {
+            chromeLauncher.kill();
+            chromeLauncher = null;
+        }
+        if (proxyForwarder != null) {
+            proxyForwarder.stop();
+            proxyForwarder = null;
+        }
         initialized = false;
     }
 
-    /**
-     * Check whether the browser session is still usable.
-     */
     private static boolean isSessionAlive() {
-        if (!initialized || page == null || browser == null) return false;
+        if (!initialized || cdp == null) return false;
+        if (chromeLauncher == null || !chromeLauncher.isAlive()) return false;
+        if (!cdp.isConnected()) return false;
         try {
-            page.title(); // lightweight check – throws if page/browser is closed
+            cdp.getTitle();
             return true;
         } catch (Exception e) {
             return false;
         }
     }
 
-    /**
-     * Tear down the current session and start a fresh one.
-     */
     private static void reinitialize() {
         System.out.println("  Reinitializing browser session...");
-        shutdown();
-        initialize();
+
+        if (cdp != null) {
+            try { cdp.close(); } catch (Exception ignored) {}
+            cdp = null;
+        }
+        if (chromeLauncher != null) {
+            chromeLauncher.kill();
+            chromeLauncher = null;
+        }
+        if (proxyForwarder != null) {
+            proxyForwarder.stop();
+            proxyForwarder = null;
+        }
+        initialized = false;
+        homepageVisited = false;
+
+        markProfileFlagged();
+        clearFlaggedProfile();
+
+        launchAndConnect();
     }
 
-    /**
-     * Search TruePeopleSearch for the given name and city/state
-     * using the shared browser session.
-     */
-    public static PersonContact search(String name, String city, String state) {
-        if (!initialized || !isSessionAlive()) {
-            if (initialized) {
-                System.out.println("  Browser session is dead, restarting...");
-            }
-            reinitialize();
-        }
+    // ===================================================================
+    //  Search
+    // ===================================================================
 
+    public static PersonContact search(String name, String city, String state) {
+        int maxRetries = 5;
+        for (int attempt = 1; attempt <= maxRetries; attempt++) {
+            if (!initialized || !isSessionAlive()) {
+                if (initialized) {
+                    System.out.println("  Browser session is dead, restarting...");
+                }
+                reinitialize();
+            }
+
+            try {
+                return doSearch(name, city, state);
+            } catch (Exception ex) {
+                String msg = ex.getMessage() != null ? ex.getMessage() : "";
+                if (msg.contains("BOT_BLOCK_DETECTED")) {
+                    System.out.println("  Bot block on attempt " + attempt + "/" + maxRetries
+                            + " - clearing profile and getting new proxy IP...");
+                    if (attempt < maxRetries) {
+                        reinitialize();
+                        long waitMs = 12000L + RNG.nextInt(15000);
+                        System.out.println("  Waiting " + (waitMs / 1000) + "s before retry...");
+                        sleep(waitMs);
+                        continue;
+                    }
+                    System.out.println("  All retry attempts exhausted. Returning empty results.");
+                } else {
+                    System.out.println("  Error during search: " + msg);
+                    if (!isSessionAlive()) {
+                        System.out.println("  Browser session lost - will reinitialize on next search.");
+                        initialized = false;
+                    }
+                }
+                break;
+            }
+        }
+        return new PersonContact();
+    }
+
+    private static PersonContact doSearch(String name, String city, String state) {
         PersonContact result = new PersonContact();
         List<String> resultLinks = new ArrayList<>();
 
-        try {
-            // ── Step 1: Build search URL and navigate directly ──────────
-            String encodedName = java.net.URLEncoder.encode(name, "UTF-8");
-            String encodedLocation = java.net.URLEncoder.encode(city + ", " + state, "UTF-8");
-            String searchUrl = BASE_LINK + "results?name=" + encodedName
-                    + "&citystatezip=" + encodedLocation;
+        // ── Visit homepage and fill the search form like a human ──────────
+        if (!homepageVisited) {
+            System.out.println("  Visiting homepage...");
+            cdp.navigate(BASE_LINK, 60000);
+            humanDelay(3000, 6000);
 
-            page.navigate(searchUrl, new Page.NavigateOptions()
-                    .setWaitUntil(WaitUntilState.DOMCONTENTLOADED)
-                    .setTimeout(60000));
+            checkForBlock("homepage");
 
-            // Wait for any CAPTCHAs on the results page
-            waitForHumanVerification(page, "results");
-            humanDelay(2000, 5000);
+            homepageVisited = true;
+            System.out.println("  Homepage loaded: " + cdp.getTitle());
+            humanDelay(2000, 4000);
 
-            System.out.println("  Results URL: " + page.url());
-            System.out.println("  Results title: " + page.title());
+            // Random mouse movements on homepage
+            randomMouseMovement(2, 4);
+        }
 
-            // Parse results
-            String html = page.content();
-            Document doc = Jsoup.parse(html);
+        // ── Fill the search form via JS + submit ─────────────────────────
+        System.out.println("  Filling search form for: " + name + " in " + city + ", " + state);
 
-            // Find result cards
-            Elements cards = doc.select("[data-detail-link]");
-            String cityState = city + ", " + state;
-            for (Element card : cards) {
-                String text = card.text();
-                if (text != null && text.contains(cityState)) {
-                    String detailLink = card.attr("data-detail-link");
-                    if (detailLink != null && !detailLink.isEmpty()) {
-                        resultLinks.add(BASE_LINK + detailLink);
-                    }
+        // Clear and fill the name field
+        cdp.evaluate("document.querySelector('#id-d-n').value = ''");
+        cdp.evaluate("document.querySelector('#id-d-n').focus()");
+        humanDelay(300, 600);
+        typeWithHumanSpeed("#id-d-n", name);
+        humanDelay(500, 1000);
+
+        // Clear and fill the location field
+        String location = city + ", " + state;
+        cdp.evaluate("document.querySelector('#id-d-loc-name').value = ''");
+        cdp.evaluate("document.querySelector('#id-d-loc-name').focus()");
+        humanDelay(300, 600);
+        typeWithHumanSpeed("#id-d-loc-name", location);
+        humanDelay(800, 1500);
+
+        // Random mouse move before clicking
+        randomMouseMovement(1, 2);
+
+        // Click the search button via JS (simulates a real click event)
+        System.out.println("  Clicking search button...");
+        cdp.evaluate(
+            "var btn = document.querySelector('#btnSubmit-d-n');" +
+            "if(btn) { btn.click(); }"
+        );
+
+        // Wait for navigation/results to load
+        humanDelay(5000, 8000);
+
+        // Check for blocks on the results page
+        checkForBlock("results");
+
+        String title = cdp.getTitle();
+        String currentUrl = cdp.getCurrentUrl();
+        System.out.println("  Results URL: " + currentUrl);
+        System.out.println("  Results title: " + title);
+
+        randomMouseMovement(1, 3);
+        randomScroll(1, 3);
+
+        // Parse results HTML
+        String html = cdp.getPageHtml();
+        Document doc = Jsoup.parse(html);
+
+        Elements cards = doc.select("[data-detail-link]");
+        String cityState = city + ", " + state;
+        for (Element card : cards) {
+            if (card.text().contains(cityState)) {
+                String detailLink = card.attr("data-detail-link");
+                if (!detailLink.isEmpty()) {
+                    String fullUrl = detailLink.startsWith("http") ? detailLink
+                            : "https://www.truepeoplesearch.com" + detailLink;
+                    resultLinks.add(fullUrl);
                 }
-            }
-
-            // Fallback: try links containing /find/person/
-            if (resultLinks.isEmpty()) {
-                Elements personLinks = doc.select("a[href*='/find/person/']");
-                for (Element link : personLinks) {
-                    String href = link.attr("href");
-                    if (href != null && !href.isEmpty()) {
-                        String fullUrl = href.startsWith("http") ? href : BASE_LINK + href.replaceFirst("^/", "");
-                        if (!resultLinks.contains(fullUrl)) {
-                            resultLinks.add(fullUrl);
-                        }
-                    }
-                }
-            }
-
-            System.out.println("  Found persons: " + resultLinks.size());
-
-        } catch (Exception ex) {
-            System.out.println("  Error during search: " + ex.getMessage());
-            // If the browser died, mark session as dead so next call reinitializes
-            if (!isSessionAlive()) {
-                System.out.println("  Browser session lost — will reinitialize on next search.");
-                initialized = false;
             }
         }
 
-        // ── Step 2: Visit each detail link and scrape phones/emails ─────
+        // Fallback: grab all person links
+        if (resultLinks.isEmpty()) {
+            for (Element card : cards) {
+                String detailLink = card.attr("data-detail-link");
+                if (!detailLink.isEmpty()) {
+                    String fullUrl = detailLink.startsWith("http") ? detailLink
+                            : "https://www.truepeoplesearch.com" + detailLink;
+                    resultLinks.add(fullUrl);
+                }
+            }
+        }
+
+        if (resultLinks.isEmpty()) {
+            Elements personLinks = doc.select("a[href*='/find/person/']");
+            for (Element link : personLinks) {
+                String href = link.attr("href");
+                if (!href.isEmpty()) {
+                    String fullUrl = href.startsWith("http") ? href
+                            : "https://www.truepeoplesearch.com" + (href.startsWith("/") ? "" : "/") + href;
+                    if (!resultLinks.contains(fullUrl)) {
+                        resultLinks.add(fullUrl);
+                    }
+                }
+            }
+        }
+
+        System.out.println("  Found persons: " + resultLinks.size());
+
+        // ── Visit each detail page ───────────────────────────────────────
         Set<String> foundPhones = new LinkedHashSet<>();
         Set<String> foundEmails = new LinkedHashSet<>();
 
-        for (String link : resultLinks) {
+        for (int idx = 0; idx < resultLinks.size(); idx++) {
+            String link = resultLinks.get(idx);
             try {
-                System.out.println("  Visiting: " + link);
-                page.navigate(link, new Page.NavigateOptions()
-                        .setWaitUntil(WaitUntilState.DOMCONTENTLOADED)
-                        .setTimeout(60000));
+                System.out.println("  Visiting detail " + (idx + 1) + "/" + resultLinks.size()
+                        + ": " + link);
+                humanDelay(3000, 6000);
 
-                waitForHumanVerification(page, "detail");
-                humanDelay(2000, 5000);
+                cdp.navigate(link, 60000);
+                humanDelay(3000, 5000);
 
-                String html = page.content();
-                Document doc = Jsoup.parse(html);
-                String pageText = doc.body().text();
+                checkForBlock("detail");
 
-                // Extract phone numbers
+                randomScroll(2, 5);
+                humanDelay(1000, 2000);
+
+                String detailHtml = cdp.getPageHtml();
+                Document detailDoc = Jsoup.parse(detailHtml);
+                String pageText = detailDoc.body().text();
+
                 Matcher pm = PHONE_PATTERN.matcher(pageText);
-                while (pm.find()) {
-                    foundPhones.add(pm.group());
-                }
+                while (pm.find()) foundPhones.add(pm.group());
 
-                // Extract emails (exclude support email)
                 Matcher em = EMAIL_PATTERN.matcher(pageText);
                 while (em.find()) {
                     String email = em.group();
@@ -371,11 +418,12 @@ public class TruePeopleSearchScraper {
                         foundEmails.add(email);
                     }
                 }
-
             } catch (Exception ex) {
-                System.out.println("  Error on detail page: " + ex.getMessage());
+                String msg = ex.getMessage() != null ? ex.getMessage() : "";
+                if (msg.contains("BOT_BLOCK_DETECTED")) throw ex;
+                System.out.println("  Error on detail page: " + msg);
                 if (!isSessionAlive()) {
-                    System.out.println("  Browser session lost — skipping remaining detail pages.");
+                    System.out.println("  Browser session lost - skipping remaining detail pages.");
                     initialized = false;
                     break;
                 }
@@ -387,86 +435,134 @@ public class TruePeopleSearchScraper {
         return result;
     }
 
-    // ── Helper methods ──────────────────────────────────────────────────────
+    // ===================================================================
+    //  Helpers
+    // ===================================================================
 
     /**
-     * Returns true only for errors that mean the browser/page is gone for good.
+     * Type text into a field using CDP Input events, character by character
+     * with human-like random delays.
      */
-    private static boolean isFatalBrowserError(PlaywrightException e) {
-        String msg = e.getMessage();
-        if (msg == null) return false;
-        return msg.contains("Target page, context or browser has been closed")
-                || msg.contains("Browser has been closed")
-                || msg.contains("browser.newContext: Browser closed");
-    }
+    private static void typeWithHumanSpeed(String selector, String text) {
+        // Focus the element
+        cdp.evaluate("document.querySelector('" + escapeJs(selector) + "').focus()");
+        humanDelay(200, 400);
 
-    private static void waitForHumanVerification(Page pg, String ctx) {
-        int maxWait = 60; // 60 * 2s = 120 seconds max
-        boolean prompted = false;
-        for (int i = 0; i < maxWait; i++) {
-            String title = "";
-            String bodyText = "";
-
-            try {
-                // Let the page settle if it's mid-navigation
-                pg.waitForLoadState(com.microsoft.playwright.options.LoadState.DOMCONTENTLOADED,
-                        new Page.WaitForLoadStateOptions().setTimeout(5000));
-            } catch (PlaywrightException e) {
-                if (isFatalBrowserError(e)) throw e;
-                // timeout or navigation-in-progress — that's fine, we'll check what we can
-            }
-
-            try {
-                title = pg.title().toLowerCase();
-            } catch (PlaywrightException e) {
-                if (isFatalBrowserError(e)) throw e;
-                // "Execution context was destroyed" = page is navigating, treat as still blocked
-            }
-
-            try {
-                bodyText = pg.innerText("body").trim();
-            } catch (PlaywrightException e) {
-                if (isFatalBrowserError(e)) throw e;
-                // transient error during navigation
-            }
-
-            boolean isBlocked = title.isEmpty() // couldn't even read title — page is navigating
-                    || title.contains("just a moment")
-                    || title.contains("attention required")
-                    || title.contains("captcha challenge")
-                    || bodyText.contains("Verification Required")
-                    || bodyText.contains("Slide right to secure your access")
-                    || bodyText.contains("Access is temporarily restricted")
-                    || bodyText.contains("We detect unusual activity")
-                    || (bodyText.length() < 50 && title.equals("truepeoplesearch.com"));
-
-            if (!isBlocked) {
-                return; // Page is clear, proceed
-            }
-
-            if (!prompted) {
-                System.out.println("  ** CAPTCHA/verification detected on " + ctx
-                        + " — please solve it in the browser window **");
-                prompted = true;
-            }
-            if (i % 5 == 0 && i > 0) {
-                System.out.println("  Waiting for manual verification... (" + (i * 2) + "s)");
-            }
-
-            try {
-                pg.waitForTimeout(2000);
-            } catch (PlaywrightException e) {
-                if (isFatalBrowserError(e)) throw e;
+        // Type each character via dispatchKeyEvent
+        for (char c : text.toCharArray()) {
+            cdp.typeText(String.valueOf(c), 50, 150);
+            // Occasionally pause longer (simulating thinking)
+            if (RNG.nextInt(10) == 0) {
+                humanDelay(200, 500);
             }
         }
 
-        System.out.println("  WARNING: Verification timeout after 120s, continuing anyway");
+        // Dispatch input event so JS listeners fire
+        cdp.evaluate(
+            "var el = document.querySelector('" + escapeJs(selector) + "');" +
+            "el.dispatchEvent(new Event('input', {bubbles:true}));" +
+            "el.dispatchEvent(new Event('change', {bubbles:true}));"
+        );
+    }
+
+    /** Escape a string for embedding in JS single-quoted string. */
+    private static String escapeJs(String s) {
+        return s.replace("\\", "\\\\").replace("'", "\\'");
     }
 
     /**
-     * Random delay to mimic human behavior.
+     * Check current page for bot blocks. Throws RuntimeException with
+     * BOT_BLOCK_DETECTED if a hard block is detected. Waits for solvable
+     * CAPTCHAs.
      */
+    private static void checkForBlock(String ctx) {
+        int maxWait = 90; // up to 180 seconds
+        boolean prompted = false;
+
+        for (int i = 0; i < maxWait; i++) {
+            String title = "", bodyText = "", rawHtml = "";
+            try { title = cdp.getTitle(); } catch (Exception ignored) {}
+            try { bodyText = cdp.getBodyText(); } catch (Exception ignored) {}
+            try { rawHtml = cdp.getPageHtml(); } catch (Exception ignored) {}
+
+            String titleLower = title.toLowerCase();
+            String bodyLower = bodyText.toLowerCase();
+            String htmlLower = rawHtml.toLowerCase();
+
+            // ── Hard block — need new IP ─────────────────────────────────
+            boolean isHardBlock =
+                    bodyLower.contains("access is temporarily restricted")
+                    || htmlLower.contains("access is temporarily restricted")
+                    || bodyLower.contains("we detected unusual activity")
+                    || htmlLower.contains("we detected unusual activity")
+                    || bodyLower.contains("automated (bot) activity")
+                    || htmlLower.contains("automated (bot) activity");
+
+            if (isHardBlock) {
+                System.out.println("  !! Hard block detected on " + ctx);
+                System.out.println("  [DEBUG] Title: " + title);
+                System.out.println("  [DEBUG] Body (first 200): "
+                        + bodyText.substring(0, Math.min(200, bodyText.length())).replace("\n", " "));
+                markProfileFlagged();
+                throw new RuntimeException("BOT_BLOCK_DETECTED: Access is temporarily restricted");
+            }
+
+            // ── Solvable CAPTCHA — wait for user ─────────────────────────
+            boolean isBlocked = titleLower.isEmpty()
+                    || titleLower.contains("just a moment")
+                    || titleLower.contains("attention required")
+                    || titleLower.contains("captcha challenge")
+                    || bodyLower.contains("verification required")
+                    || bodyLower.contains("slide right to secure your access")
+                    || htmlLower.contains("captcha-delivery.com")
+                    || htmlLower.contains("datadome device check")
+                    || (bodyText.trim().length() < 50 && titleLower.equals("truepeoplesearch.com"));
+
+            if (!isBlocked) return; // all clear!
+
+            if (!prompted) {
+                System.out.println("  ** CAPTCHA detected on " + ctx
+                        + " - please solve it in the Chrome window! **");
+                System.out.println("  [DEBUG] Title: " + title);
+                java.awt.Toolkit.getDefaultToolkit().beep();
+                prompted = true;
+            }
+            if (i % 5 == 0 && i > 0) {
+                System.out.println("  Still waiting for verification... (" + (i * 2) + "s)");
+                java.awt.Toolkit.getDefaultToolkit().beep();
+            }
+
+            sleep(2000);
+        }
+        System.out.println("  WARNING: Verification timeout after 180s, continuing anyway");
+    }
+
+    private static void randomMouseMovement(int minMoves, int maxMoves) {
+        int moves = minMoves + RNG.nextInt(maxMoves - minMoves + 1);
+        for (int i = 0; i < moves; i++) {
+            double x = 100.0 + RNG.nextInt(Math.max(1, viewportWidth - 200));
+            double y = 100.0 + RNG.nextInt(Math.max(1, viewportHeight - 200));
+            try { cdp.mouseMove(x, y); } catch (Exception ignored) {}
+            sleep(100 + RNG.nextInt(300));
+        }
+    }
+
+    private static void randomScroll(int minScrolls, int maxScrolls) {
+        int scrolls = minScrolls + RNG.nextInt(maxScrolls - minScrolls + 1);
+        double cx = viewportWidth / 2.0;
+        double cy = viewportHeight / 2.0;
+        for (int i = 0; i < scrolls; i++) {
+            int distance = 150 + RNG.nextInt(400);
+            try { cdp.scroll(0, distance, cx, cy); } catch (Exception ignored) {}
+            sleep(500 + RNG.nextInt(1500));
+        }
+    }
+
     private static void humanDelay(int minMs, int maxMs) {
-        page.waitForTimeout(minMs + RANDOM.nextInt(maxMs - minMs));
+        sleep(minMs + RNG.nextInt(Math.max(1, maxMs - minMs)));
+    }
+
+    private static void sleep(long ms) {
+        try { Thread.sleep(ms); } catch (InterruptedException ignored) {}
     }
 }
