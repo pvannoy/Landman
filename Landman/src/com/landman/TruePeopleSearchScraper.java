@@ -1,472 +1,972 @@
 package com.landman;
 
-import com.microsoft.playwright.*;
-import com.microsoft.playwright.options.WaitUntilState;
-import org.jsoup.Jsoup;
-import org.jsoup.nodes.Document;
-import org.jsoup.nodes.Element;
-import org.jsoup.select.Elements;
-
-import com.google.gson.JsonArray;
-import com.google.gson.JsonObject;
-
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.Paths;
-import java.util.*;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
+import org.openqa.selenium.By;
+import org.openqa.selenium.JavascriptExecutor;
+import org.openqa.selenium.PageLoadStrategy;
+import org.openqa.selenium.WebDriver;
+import org.openqa.selenium.WebElement;
+import org.openqa.selenium.chrome.ChromeDriver;
+import org.openqa.selenium.chrome.ChromeOptions;
+import org.openqa.selenium.devtools.DevTools;
+import org.openqa.selenium.devtools.v144.page.Page;
+import org.openqa.selenium.support.ui.ExpectedCondition;
+import org.openqa.selenium.support.ui.ExpectedConditions;
+import org.openqa.selenium.support.ui.WebDriverWait;
+
 /**
- * Scraper that queries truepeoplesearch.com for a name + city/state and
- * extracts phone numbers and email addresses from the detail pages.
+ * Scraper for truepeoplesearch.com.
  *
- * Launches real Chrome (not Playwright's Chromium) with remote debugging,
- * then connects via CDP. This avoids all Playwright automation flags that
- * anti-bot systems detect.
+ * Called from Main.java as: TruePeopleSearchScraper.search(name, city, state)
+ *
+ * Cloudflare bypass strategy:
+ *   1. Uses your REAL Chrome user profile (Default) — this carries existing
+ *      Cloudflare trust cookies and a real browsing history fingerprint.
+ *   2. Injects CDP-level stealth scripts via Page.addScriptToEvaluateOnNewDocument
+ *      so they run before any page JS, masking every Selenium/automation signal.
+ *   3. Removes all Selenium automation flags from ChromeOptions.
+ *   4. PageLoadStrategy.NONE prevents driver.get() from hanging on challenge pages.
+ *
+ * IMPORTANT: Chrome must be fully closed before starting the program.
+ * Selenium cannot attach to an already-running Chrome using a user profile.
  */
 public class TruePeopleSearchScraper {
 
-    private static final String BASE_LINK = "https://www.truepeoplesearch.com/";
-
-    // ── Proxy configuration ──────────────────────────────────────────────
-    private static final boolean USE_PROXY = true;
-    private static final String PROXY_SERVER = "premium.residential.proxyrack.net:9000";
-    private static final String PROXY_USERNAME = "gefabebibozasu-country-US";
-    private static final String PROXY_PASSWORD = "TJEZYCE-6CBC90A-NUMCLFK-QVADQS7-7YK3VAU-UCFS8QQ-PCHOUQJ";
-
-    private static final int CDP_PORT = 9222;
-
-    private static final Pattern PHONE_PATTERN = Pattern.compile("\\(\\d{3}\\) \\d{3}-\\d{4}");
-    private static final Pattern EMAIL_PATTERN = Pattern.compile(
-            "\\b[A-Za-z0-9._%+\\-]+@[A-Za-z0-9.\\-]+\\.[A-Za-z]{2,}\\b");
-    private static final Random RANDOM = new Random();
-
-    // Persistent profile so cookies/CAPTCHA tokens survive across runs
-    private static final String PROFILE_DIR =
-            Paths.get(System.getProperty("user.home"), ".landman-browser-profile").toString();
-
-    // ── Shared browser session ──────────────────────────────────────────────
-    private static Playwright playwright;
-    private static Browser browser;
-    private static BrowserContext context;
-    private static Page page;
-    private static CDPSession cdpSession;
-    private static Process chromeProcess;
-    private static boolean initialized = false;
+    // ── Inner result type ─────────────────────────────────────────────────────
 
     public static class PersonContact {
+        public String detailUrl;
         public final List<String> phones = new ArrayList<>();
         public final List<String> emails = new ArrayList<>();
-    }
 
-    /**
-     * Find Chrome executable on the system.
-     */
-    private static String findChrome() {
-        String[] candidates = {
-                "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
-                "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
-                System.getenv("LOCALAPPDATA") + "\\Google\\Chrome\\Application\\chrome.exe"
-        };
-        for (String path : candidates) {
-            if (path != null && Files.exists(Path.of(path))) return path;
-        }
-        throw new RuntimeException("Chrome not found. Please install Google Chrome.");
-    }
-
-    /**
-     * Set up CDP-level proxy authentication. This intercepts 407 challenges
-     * and provides credentials directly via the DevTools protocol — no
-     * extensions needed.
-     */
-    private static void setupCDPProxyAuth(Page pg) {
-        try {
-            cdpSession = context.newCDPSession(pg);
-
-            // Register event handlers BEFORE enabling Fetch
-            // so we don't miss any events
-
-            // Handle proxy 407 auth challenges with our credentials
-            cdpSession.on("Fetch.authRequired", event -> {
-                try {
-                    JsonObject ev = (JsonObject) event;
-                    String requestId = ev.get("requestId").getAsString();
-                    System.out.println("  [CDP] Auth challenge received, providing credentials...");
-
-                    JsonObject authResponse = new JsonObject();
-                    authResponse.addProperty("response", "ProvideCredentials");
-                    authResponse.addProperty("username", PROXY_USERNAME);
-                    authResponse.addProperty("password", PROXY_PASSWORD);
-
-                    JsonObject params = new JsonObject();
-                    params.addProperty("requestId", requestId);
-                    params.add("authChallengeResponse", authResponse);
-
-                    cdpSession.send("Fetch.continueWithAuth", params);
-                } catch (Exception e) {
-                    System.out.println("  CDP proxy auth error: " + e.getMessage());
-                }
-            });
-
-            // Every intercepted request must be resumed immediately
-            cdpSession.on("Fetch.requestPaused", event -> {
-                try {
-                    JsonObject ev = (JsonObject) event;
-                    String requestId = ev.get("requestId").getAsString();
-
-                    JsonObject params = new JsonObject();
-                    params.addProperty("requestId", requestId);
-                    cdpSession.send("Fetch.continueRequest", params);
-                } catch (Exception e) {
-                    // ignore — request may already have been handled
-                }
-            });
-
-            // Now enable Fetch — intercept ALL requests so auth events fire
-            JsonObject fetchParams = new JsonObject();
-            fetchParams.addProperty("handleAuthRequests", true);
-            // No patterns = all requests are intercepted (required for auth to work)
-            cdpSession.send("Fetch.enable", fetchParams);
-
-            System.out.println("  CDP proxy auth handler installed");
-        } catch (Exception e) {
-            System.out.println("  WARNING: Could not set up CDP proxy auth: " + e.getMessage());
-            System.out.println("  You may need to enter proxy credentials manually in the browser.");
+        @Override
+        public String toString() {
+            StringBuilder sb = new StringBuilder();
+            sb.append("Detail URL: ").append(detailUrl).append("\n");
+            sb.append("Phones:\n");
+            for (String p : phones) sb.append("  ").append(p).append("\n");
+            sb.append("Emails:\n");
+            for (String e : emails) sb.append("  ").append(e).append("\n");
+            return sb.toString();
         }
     }
 
-    /**
-     * Launch real Chrome with remote debugging and proxy, then connect via CDP.
-     * This avoids all Playwright automation flags that anti-bot systems detect.
-     */
-    public static void initialize() {
-        System.setProperty("PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD", "1");
+    // ── Proxy configuration ──────────────────────────────────────────────────
+    //
+    // Set PROXY_ENABLED = true and fill in your ProxyRack credentials to route
+    // all browser traffic through a rotating residential proxy. This prevents
+    // IP-based rate limiting from truepeoplesearch.com (/ratelimited page).
+    //
+    // How to get these values from ProxyRack:
+    //   1. Log in at proxyrack.com → Dashboard → Residential Proxies
+    //   2. Copy your Username and Password from the "Authentication" section
+    //   3. The gateway host and port are shown in the "Endpoint" section
+    //      (typically: proxy.proxyrack.net  port: 10000)
+    //
+    // Leave PROXY_ENABLED = false to run without a proxy (default).
+    // ─────────────────────────────────────────────────────────────────────────
 
-        // Kill any Chrome already using our debug port
+    private static final boolean PROXY_ENABLED  = false;
+    private static final String  PROXY_HOST     = "proxy.proxyrack.net";
+    private static final int     PROXY_PORT     = 10000;
+    private static final String  PROXY_USERNAME = "YOUR_PROXYRACK_USERNAME";
+    private static final String  PROXY_PASSWORD = "YOUR_PROXYRACK_PASSWORD";
+
+    // ── Patterns ──────────────────────────────────────────────────────────────
+
+    /** US phone numbers: (555) 123-4567, 555-123-4567, 5551234567 */
+    private static final Pattern PHONE_PATTERN =
+            Pattern.compile("(\\(?\\d{3}\\)?[-.\\s]?\\d{3}[-.\\s]?\\d{4})");
+
+    /** Email addresses */
+    private static final Pattern EMAIL_PATTERN =
+            Pattern.compile("[A-Za-z0-9._%+\\-]+@[A-Za-z0-9.\\-]+\\.[A-Za-z]{2,}");
+
+    /** c/o PersonName on a line */
+    private static final Pattern CO_PATTERN =
+            Pattern.compile("(?i)c/o\\s+(.+)");
+
+    /** a/k/a alias — keep only the primary name */
+    private static final Pattern AKA_PATTERN =
+            Pattern.compile("(?i)\\s+a/k/a\\b.*");
+
+    /** "and SecondPerson" — keep only the first */
+    private static final Pattern AND_PATTERN =
+            Pattern.compile("(?i)\\s+and\\b.*");
+
+    /** Entity suffix words to strip */
+    private static final Pattern ENTITY_SUFFIX_PATTERN =
+            Pattern.compile("(?i)\\s+(gst|exemption|residuary|trust|estate|revocable|living|"
+                    + "irrevocable|testamentary|fund|foundation|llc|inc\\.?|ltd\\.?|corp\\.?|"
+                    + "co\\.|l\\.l\\.c\\.).*$");
+
+    /** Entity prefix words to strip */
+    private static final Pattern ENTITY_PREFIX_PATTERN =
+            Pattern.compile("(?i)^(estate|trust|gst|residuary|exemption|revocable|living|family|"
+                    + "irrevocable|testamentary|intervivos|inter\\s+vivos)\\s+(of\\s+)?");
+
+    /** Trailing generational suffixes */
+    private static final Pattern SUFFIX_PATTERN =
+            Pattern.compile("(?i),?\\s*(Jr\\.?|Sr\\.?|II|III|IV|V|VI)\\s*$");
+
+    // ── Stealth script injected before every page load ────────────────────────
+
+    /**
+     * This script runs via CDP's Page.addScriptToEvaluateOnNewDocument,
+     * meaning it executes BEFORE any page JavaScript sees the window.
+     * It masks every property Cloudflare checks to detect automation.
+     */
+    private static final String STEALTH_SCRIPT = """
+            // 1. Remove navigator.webdriver
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+
+            // 2. Restore plugins array (headless Chrome has 0 plugins)
+            Object.defineProperty(navigator, 'plugins', {
+                get: () => [1, 2, 3, 4, 5],
+            });
+
+            // 3. Restore languages
+            Object.defineProperty(navigator, 'languages', {
+                get: () => ['en-US', 'en'],
+            });
+
+            // 4. Fix chrome object (missing in CDP-controlled Chrome)
+            window.chrome = {
+                runtime: {},
+                loadTimes: function() {},
+                csi: function() {},
+                app: {}
+            };
+
+            // 5. Fix permissions (automation returns different values)
+            const originalQuery = window.navigator.permissions.query;
+            window.navigator.permissions.query = (parameters) => (
+                parameters.name === 'notifications'
+                    ? Promise.resolve({ state: Notification.permission })
+                    : originalQuery(parameters)
+            );
+
+            // 6. WebGL vendor/renderer — headless Chrome reports "SwiftShader"
+            const getParameter = WebGLRenderingContext.prototype.getParameter;
+            WebGLRenderingContext.prototype.getParameter = function(parameter) {
+                if (parameter === 37445) return 'Intel Inc.';
+                if (parameter === 37446) return 'Intel Iris OpenGL Engine';
+                return getParameter.call(this, parameter);
+            };
+            """;
+
+    // ── Shared WebDriver singleton ────────────────────────────────────────────
+
+    private static ChromeDriver driver;
+
+    /**
+     * Kills any lingering Chrome processes that would block profile access.
+     * Chrome keeps a background process alive even after all windows are closed,
+     * which causes "DevToolsActivePort file doesn't exist" on the next launch.
+     */
+    /**
+     * Runs a single taskkill command with a 5-second timeout.
+     * Uses ProcessBuilder with stream redirection to prevent output-buffer hangs.
+     */
+    private static void taskkill(String... args) {
         try {
-            new ProcessBuilder("cmd", "/c",
-                    "for /f \"tokens=5\" %a in ('netstat -aon ^| findstr :" + CDP_PORT + "') do taskkill /F /PID %a")
-                    .start().waitFor();
+            String[] cmd = new String[args.length + 1];
+            cmd[0] = "taskkill";
+            System.arraycopy(args, 0, cmd, 1, args.length);
+            ProcessBuilder pb = new ProcessBuilder(cmd);
+            pb.redirectErrorStream(true);                  // merge stderr into stdout
+            pb.redirectOutput(ProcessBuilder.Redirect.DISCARD); // discard output entirely
+            Process p = pb.start();
+            if (!p.waitFor(5, java.util.concurrent.TimeUnit.SECONDS)) {
+                p.destroyForcibly();                       // kill if still running after 5 s
+            }
         } catch (Exception ignored) {}
+    }
 
-        // Build Chrome command line — NO automation flags at all
-        List<String> chromeArgs = new ArrayList<>(List.of(
-                findChrome(),
-                "--remote-debugging-port=" + CDP_PORT,
-                "--user-data-dir=" + PROFILE_DIR,
-                "--no-first-run",
-                "--no-default-browser-check",
-                "--window-size=1920,1080",
-                "--start-maximized"
-        ));
-
-        if (USE_PROXY) {
-            chromeArgs.add("--proxy-server=http://" + PROXY_SERVER);
-            System.out.println("  Proxy enabled: " + PROXY_SERVER);
-        }
-
-        System.out.println("  Browser profile: " + PROFILE_DIR);
-        System.out.println("  Launching Chrome with CDP on port " + CDP_PORT + "...");
-
+    private static void killExistingChrome() {
         try {
-            chromeProcess = new ProcessBuilder(chromeArgs)
-                    .redirectErrorStream(true)
-                    .start();
+            System.out.println("Attempting to terminate Existing Chrome processes...");
 
-            // Give Chrome time to start and open the debug port
-            Thread.sleep(3000);
-        } catch (Exception e) {
-            throw new RuntimeException("Failed to launch Chrome: " + e.getMessage(), e);
-        }
+            // Graceful shutdown first, then force-kill
+            taskkill("/IM", "chrome.exe", "/T");
+            Thread.sleep(1000);
+            taskkill("/F", "/IM", "chrome.exe", "/T");
+            taskkill("/F", "/IM", "chrome_crashpad_handler.exe", "/T");
 
-        // Connect Playwright to the real Chrome via CDP
-        playwright = Playwright.create();
-        browser = playwright.chromium().connectOverCDP("http://localhost:" + CDP_PORT);
+            // Diagnose profile directory state
+            String userDataPath = System.getenv("LOCALAPPDATA")
+                    + "\\Google\\Chrome\\User Data";
+            String defaultPath  = userDataPath + "\\Default";
+            String lockPath     = defaultPath  + "\\lockfile";
 
-        List<BrowserContext> contexts = browser.contexts();
-        context = contexts.isEmpty() ? browser.newContext() : contexts.get(0);
+            java.io.File userDataDir = new java.io.File(userDataPath);
+            java.io.File defaultDir  = new java.io.File(defaultPath);
+            java.io.File lockFile    = new java.io.File(lockPath);
 
-        List<Page> pages = context.pages();
-        page = pages.isEmpty() ? context.newPage() : pages.get(0);
+            System.out.println("  LOCALAPPDATA     = " + System.getenv("LOCALAPPDATA"));
+            System.out.println("  User Data exists : " + userDataDir.exists()
+                    + "  (" + userDataDir.getAbsolutePath() + ")");
+            System.out.println("  Default exists   : " + defaultDir.exists());
+            System.out.println("  lockfile exists  : " + lockFile.exists());
 
-        // Set up CDP proxy auth BEFORE navigating
-        if (USE_PROXY && !PROXY_USERNAME.isEmpty()) {
-            setupCDPProxyAuth(page);
-        }
+            // Poll up to 15 s for lockfile to disappear
+            for (int i = 0; i < 30; i++) {
+                if (!lockFile.exists()) {
+                    System.out.println("  lockfile gone after " + (i * 500) + " ms");
+                    break;
+                }
+                if (i == 29) {
+                    System.out.println("  WARNING: lockfile still present after 15 s");
+                }
+                Thread.sleep(500);
+            }
 
-        // Navigate to homepage
-        System.out.println("  Opening TruePeopleSearch...");
-        page.navigate(BASE_LINK, new Page.NavigateOptions()
-                .setWaitUntil(WaitUntilState.DOMCONTENTLOADED)
-                .setTimeout(60000));
-
-        // Wait for Cloudflare and any CAPTCHAs to be solved
-        waitForHumanVerification(page, "homepage");
-
-        // Disable CDP Fetch interception now that proxy credentials are cached.
-        // Keeping Fetch active changes network timing in ways anti-bot detects.
-        if (cdpSession != null) {
+            // Verify write access to the Default directory
+            java.io.File testFile = new java.io.File(defaultPath + "\\selenium_write_test.tmp");
             try {
-                cdpSession.send("Fetch.disable");
-                System.out.println("  CDP Fetch disabled (proxy credentials cached)");
-            } catch (Exception ignored) {}
+                boolean created = testFile.createNewFile();
+                System.out.println("  Write access to Default dir: " + created);
+                if (created) testFile.delete();
+            } catch (Exception writeEx) {
+                System.out.println("  Write access FAILED: " + writeEx.getMessage());
+            }
+
+            Thread.sleep(1000);
+            System.out.println("Existing Chrome processes terminated.");
+        } catch (Exception e) {
+            System.out.println("killExistingChrome error: " + e.getClass().getSimpleName()
+                    + ": " + e.getMessage());
+        }
+    }
+
+    /**
+     * Builds a ChromeOptions object with all stealth and stability flags.
+     */
+    private static ChromeOptions buildBaseOptions() {
+        ChromeOptions opts = new ChromeOptions();
+        opts.addArguments("--disable-blink-features=AutomationControlled");
+        opts.addArguments("--no-sandbox");
+        opts.addArguments("--disable-dev-shm-usage");
+        opts.addArguments("--disable-infobars");
+        opts.addArguments("--start-maximized");
+        opts.addArguments("--no-first-run");
+        opts.addArguments("--no-default-browser-check");
+        opts.addArguments("--disable-extensions");
+        opts.addArguments("--disable-component-update");
+        opts.addArguments("--disable-background-networking");
+        opts.addArguments(
+                "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                + "AppleWebKit/537.36 (KHTML, like Gecko) "
+                + "Chrome/146.0.0.0 Safari/537.36");
+        opts.setExperimentalOption("excludeSwitches", new String[]{"enable-automation"});
+        opts.setExperimentalOption("useAutomationExtension", false);
+        opts.setPageLoadStrategy(PageLoadStrategy.NONE);
+
+        // ── Proxy (set PROXY_ENABLED = true and fill in credentials above) ───
+        if (PROXY_ENABLED) {
+            // Route all browser traffic through the ProxyRack residential proxy.
+            // Username:password authentication is handled via a local proxy extension
+            // injected into the browser at launch so Chrome can authenticate silently.
+            String proxyExtPath = buildProxyAuthExtension();
+            if (proxyExtPath != null) {
+                opts.addArguments("--proxy-server=http://" + PROXY_HOST + ":" + PROXY_PORT);
+                opts.addExtensions(new java.io.File(proxyExtPath));
+                System.out.println("  Proxy enabled: " + PROXY_HOST + ":" + PROXY_PORT
+                        + " (user: " + PROXY_USERNAME + ")");
+            } else {
+                // Extension build failed — fall back to unauthenticated proxy
+                // (will only work if ProxyRack allows IP-whitelisted connections)
+                opts.addArguments("--proxy-server=http://" + PROXY_HOST + ":" + PROXY_PORT);
+                System.out.println("  Proxy enabled (no auth extension): " + PROXY_HOST + ":" + PROXY_PORT);
+            }
         }
 
-        System.out.println("  Browser session ready: " + page.title());
-        initialized = true;
+        return opts;
     }
 
     /**
-     * Shut down the shared browser session.
+     * Builds a tiny Chrome extension that handles proxy authentication silently.
+     * Chrome blocks the proxy auth dialog in automated sessions, so we inject
+     * the credentials via a background script instead.
+     *
+     * The extension is written to a temp zip file and returned as a path string.
+     * Returns null if the extension could not be created.
      */
-    public static void shutdown() {
+    private static String buildProxyAuthExtension() {
         try {
-            if (cdpSession != null) cdpSession.detach();
-        } catch (Exception ignored) {}
-        try {
-            if (browser != null) browser.close();
-        } catch (Exception ignored) {}
-        try {
-            if (playwright != null) playwright.close();
-        } catch (Exception ignored) {}
-        try {
-            if (chromeProcess != null && chromeProcess.isAlive()) chromeProcess.destroyForcibly();
-        } catch (Exception ignored) {}
-        page = null;
-        context = null;
-        browser = null;
-        cdpSession = null;
-        playwright = null;
-        chromeProcess = null;
-        initialized = false;
+            // background.js — intercepts proxy auth challenges and supplies credentials
+            String backgroundJs = String.format("""
+                    var config = {
+                        mode: "fixed_servers",
+                        rules: {
+                            singleProxy: {
+                                scheme: "http",
+                                host: "%s",
+                                port: %d
+                            },
+                            bypassList: ["localhost"]
+                        }
+                    };
+                    chrome.proxy.settings.set({value: config, scope: "regular"}, function(){});
+                    chrome.webRequest.onAuthRequired.addListener(
+                        function(details) {
+                            return { authCredentials: { username: "%s", password: "%s" } };
+                        },
+                        {urls: ["<all_urls>"]},
+                        ["blocking"]
+                    );
+                    """, PROXY_HOST, PROXY_PORT, PROXY_USERNAME, PROXY_PASSWORD);
+
+            // manifest.json — declares the permissions the background script needs
+            String manifestJson = """
+                    {
+                        "version": "1.0.0",
+                        "manifest_version": 2,
+                        "name": "ProxyAuth",
+                        "permissions": [
+                            "proxy", "tabs", "unlimitedStorage", "storage",
+                            "<all_urls>", "webRequest", "webRequestBlocking"
+                        ],
+                        "background": { "scripts": ["background.js"] },
+                        "minimum_chrome_version": "76.0.0"
+                    }
+                    """;
+
+            // Write both files into a zip (Chrome extension format)
+            java.nio.file.Path extDir = java.nio.file.Files.createTempDirectory("proxyext");
+            java.nio.file.Path zipPath = extDir.resolve("proxy_auth.zip");
+
+            try (java.util.zip.ZipOutputStream zos = new java.util.zip.ZipOutputStream(
+                    new java.io.FileOutputStream(zipPath.toFile()))) {
+                zos.putNextEntry(new java.util.zip.ZipEntry("background.js"));
+                zos.write(backgroundJs.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                zos.closeEntry();
+                zos.putNextEntry(new java.util.zip.ZipEntry("manifest.json"));
+                zos.write(manifestJson.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                zos.closeEntry();
+            }
+
+            return zipPath.toString();
+        } catch (Exception e) {
+            System.out.println("  Could not build proxy auth extension: " + e.getMessage());
+            return null;
+        }
     }
 
     /**
-     * Check whether the browser session is still usable.
+     * Copies just the Cookies file from the real Chrome Default profile into a
+     * Selenium-owned temp directory. This lets Selenium launch a clean profile
+     * (no crash-restore dialogs, no session conflicts) while still carrying the
+     * real Cloudflare trust cookies.
+     *
+     * Returns the path to the temp user-data-dir, or null if the copy failed.
      */
-    private static boolean isSessionAlive() {
-        if (!initialized || page == null || browser == null) return false;
+    private static String buildSeleniumProfile() {
         try {
-            page.title(); // lightweight check – throws if page/browser is closed
-            return true;
+            String localAppData = System.getenv("LOCALAPPDATA");
+            java.nio.file.Path realDefault = java.nio.file.Paths.get(
+                    localAppData, "Google", "Chrome", "User Data", "Default");
+            java.nio.file.Path realUserData = java.nio.file.Paths.get(
+                    localAppData, "Google", "Chrome", "User Data");
+
+            // Selenium-owned user-data-dir — separate from the live Chrome profile
+            java.nio.file.Path seleniumUserData = java.nio.file.Paths.get(
+                    localAppData, "SeleniumLandman", "User Data");
+            java.nio.file.Path seleniumDefault = seleniumUserData.resolve("Default");
+            java.nio.file.Files.createDirectories(seleniumDefault);
+
+            // Copy Local State (global Chrome preferences)
+            java.nio.file.Path localState = realUserData.resolve("Local State");
+            if (localState.toFile().exists()) {
+                java.nio.file.Files.copy(localState,
+                        seleniumUserData.resolve("Local State"),
+                        java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            }
+
+            // Copy Cookies (carries Cloudflare trust tokens)
+            java.nio.file.Path cookies = realDefault.resolve("Cookies");
+            if (cookies.toFile().exists()) {
+                java.nio.file.Files.copy(cookies,
+                        seleniumDefault.resolve("Cookies"),
+                        java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                System.out.println("  Copied Cookies from real profile.");
+            }
+
+            // Chrome 96+ stores cookies in Default/Network/Cookies on some builds
+            java.nio.file.Path networkCookies = realDefault.resolve("Network").resolve("Cookies");
+            if (networkCookies.toFile().exists()) {
+                java.nio.file.Path seleniumNetwork = seleniumDefault.resolve("Network");
+                java.nio.file.Files.createDirectories(seleniumNetwork);
+                java.nio.file.Files.copy(networkCookies,
+                        seleniumNetwork.resolve("Cookies"),
+                        java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                System.out.println("  Copied Network/Cookies from real profile.");
+            }
+
+            return seleniumUserData.toString();
+        } catch (Exception e) {
+            System.out.println("  buildSeleniumProfile failed: " + e.getMessage());
+            return null;
+        }
+    }
+
+    private static synchronized ChromeDriver getDriver() {
+        if (driver == null) {
+
+            killExistingChrome();
+
+            // ── Strategy 1: Selenium-owned profile with real cookies copied in ─
+            // Copying just the Cookies file (not the whole profile) avoids the
+            // session-restore / crash-dialog conflicts that cause DevToolsActivePort
+            // errors, while still carrying the Cloudflare trust tokens.
+            System.out.println("Attempting to use the real Chrome user profile...");
+            String seleniumProfilePath = buildSeleniumProfile();
+
+            ChromeDriver launched = null;
+
+            if (seleniumProfilePath != null) {
+                try {
+                    ChromeOptions opts = buildBaseOptions();
+                    opts.addArguments("--user-data-dir=" + seleniumProfilePath);
+                    opts.addArguments("--profile-directory=Default");
+                    launched = new ChromeDriver(opts);
+                    System.out.println("  Launched with Selenium profile (cookies imported).");
+                } catch (Exception e) {
+                    String reason = e.getMessage() == null ? "unknown"
+                            : e.getMessage().lines().filter(l -> !l.isBlank()).findFirst().orElse("unknown");
+                    System.out.println("  Selenium profile launch failed: " + reason);
+                    launched = null;
+                }
+            }
+
+            // ── Strategy 2: Clean temp profile fallback ───────────────────────
+            if (launched == null) {
+                System.out.println("Falling back to a temporary profile (Cloudflare may prompt captcha).");
+                try {
+                    launched = new ChromeDriver(buildBaseOptions());
+                } catch (Exception e2) {
+                    throw new RuntimeException("Could not launch Chrome: " + e2.getMessage(), e2);
+                }
+            }
+
+            driver = launched;
+
+            // ── Inject stealth script via CDP ─────────────────────────────────
+            try {
+                DevTools devTools = driver.getDevTools();
+                devTools.createSession();
+                devTools.send(Page.addScriptToEvaluateOnNewDocument(STEALTH_SCRIPT, null, null, null));
+                System.out.println("CDP stealth script injected successfully.");
+            } catch (Exception e) {
+                System.out.println("CDP stealth injection skipped (" + e.getMessage() + "); using JS fallback.");
+                try {
+                    ((JavascriptExecutor) driver).executeScript(
+                            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})");
+                } catch (Exception ignored) {}
+            }
+        }
+        return driver;
+    }
+
+    /** Close the shared browser. Call once after all rows are processed. */
+    public static synchronized void quit() {
+        if (driver != null) {
+            try { driver.quit(); } catch (Exception ignored) {}
+            driver = null;
+        }
+    }
+
+    /**
+     * Kills the current browser session and clears the singleton so the next
+     * call to getDriver() (or search()) will launch a fresh Chrome instance.
+     * Called by Main.java when an UnreachableBrowserException is caught.
+     */
+    public static synchronized void restartDriver() {
+        System.out.println("Restarting browser...");
+        if (driver != null) {
+            try { driver.quit(); } catch (Exception ignored) {}
+            driver = null;
+        }
+        // Kill zombie Chrome processes from the crash, then refresh cookie copy
+        taskkill("/F", "/IM", "chrome.exe", "/T");
+        taskkill("/F", "/IM", "chrome_crashpad_handler.exe", "/T");
+        try { Thread.sleep(2000); } catch (Exception ignored) {}
+        // Refresh the Selenium profile with fresh cookies before next launch
+        buildSeleniumProfile();
+        System.out.println("Browser restart complete. New session will start on next search.");
+    }
+
+    // ── Public API ────────────────────────────────────────────────────────────
+
+    /**
+     * Entry point called by Main.java.
+     *
+     * @param name  raw name from Excel (may include suffixes, c/o, entities)
+     * @param city  city name
+     * @param state two-letter state abbreviation
+     */
+    public static PersonContact search(String name, String city, String state) throws Exception {
+        return search(getDriver(), name, city, state);
+    }
+
+    // ── Core scraping logic ───────────────────────────────────────────────────
+
+    static PersonContact search(WebDriver webDriver, String name, String city, String state)
+            throws Exception {
+
+        PersonContact result = new PersonContact();
+
+        // ── Step 1: Clean the name ────────────────────────────────────────────
+        String searchName = cleanName(name);
+        System.out.println("Search name: \"" + searchName + "\""
+                + (searchName.equals(name.trim()) ? "" : "  (cleaned from: \"" + name.trim() + "\")"));
+
+        if (searchName.isEmpty()) {
+            System.out.println("  Skipping — could not extract a usable person name.");
+            return result;
+        }
+
+        // ── Step 2: Build the results URL ─────────────────────────────────────
+        String query = "name=" + pctEncode(searchName) + "&citystatezip=" + pctEncode(city + ", " + state);
+        String resultsUrl = "https://www.truepeoplesearch.com/results?" + query;
+
+        webDriver.get(resultsUrl);
+        System.out.println("Navigated to: " + resultsUrl);
+
+        // ── Step 3: Wait for results page ────────────────────────────────────
+        System.out.println("Waiting for results page...");
+        boolean resultsReady = waitForResultsPage(webDriver);
+        if (!resultsReady) {
+            System.out.println("  Skipping row — results page did not load.");
+            return result;
+        }
+        System.out.println("Results page ready.");
+
+        // ── Step 4: Get data-detail-link from the first result card ───────────
+        String detailPath = null;
+        try {
+            WebDriverWait wait = new WebDriverWait(webDriver, Duration.ofSeconds(10));
+            WebElement firstCard = wait.until(
+                    ExpectedConditions.presenceOfElementLocated(By.cssSelector("[data-detail-link]")));
+            detailPath = firstCard.getAttribute("data-detail-link");
+        } catch (Exception ex) {
+            System.out.println("  No result cards found for: " + searchName + " / " + city + ", " + state);
+            return result;
+        }
+
+        if (detailPath == null || detailPath.isBlank()) {
+            System.out.println("  data-detail-link was empty.");
+            return result;
+        }
+
+        // ── Step 5: Navigate to the detail page ───────────────────────────────
+        result.detailUrl = "https://www.truepeoplesearch.com" + detailPath;
+        System.out.println("Detail page: " + result.detailUrl);
+        webDriver.get(result.detailUrl);
+
+        // ── Step 6: Wait for detail page to render contact data ─────────────
+        System.out.println("Waiting for detail page...");
+        boolean detailReady = waitForDetailPage(webDriver, result.detailUrl);
+        if (detailReady) {
+            System.out.println("Detail page ready.");
+        } else {
+            System.out.println("  Detail page did not fully load; scraping whatever is present.");
+        }
+
+        // ── Step 7: Extract phones and emails ────────────────────────────────
+        String html = pageHtml(webDriver);
+        if (html == null) html = "";
+
+        Set<String> phones = new LinkedHashSet<>();
+        Matcher pm = PHONE_PATTERN.matcher(html);
+        while (pm.find()) phones.add(pm.group(1).trim());
+
+        Set<String> emails = new LinkedHashSet<>();
+        Matcher em = EMAIL_PATTERN.matcher(html);
+        while (em.find()) {
+            String c = em.group();
+            if (!c.endsWith(".png") && !c.endsWith(".jpg") && !c.endsWith(".svg")
+                    && !c.endsWith(".gif") && !c.contains("sentry.io")
+                    && !c.contains("example.com") && !c.contains("w3.org")
+                    && !c.contains("schema.org")) {
+                emails.add(c);
+            }
+        }
+
+        result.phones.addAll(phones);
+        result.emails.addAll(emails);
+        return result;
+    }
+
+    // ── Detail page wait ─────────────────────────────────────────────────────
+
+    /**
+     * Waits for a TPS detail page to fully render its contact data.
+     * Handles the same three blocking states as waitForResultsPage:
+     *   A) Normal render  — waits for card-summary / card-block / data-link
+     *   B) Cloudflare / InternalCaptcha — prompts user to solve manually
+     *   C) "Access is temporarily restricted" — waits up to 10 min for cooldown
+     *
+     * If a captcha or restriction clears, re-navigates to detailUrl and waits again.
+     * Returns true if the page loaded successfully, false if it timed out.
+     */
+    private static boolean waitForDetailPage(WebDriver webDriver, String detailUrl) {
+        // Brief render pause (PageLoadStrategy.NONE returns before DOM is ready)
+        try { Thread.sleep(1500); } catch (Exception ignored) {}
+
+        // Check for immediate block states before polling
+        String currentUrl = webDriver.getCurrentUrl();
+        if (currentUrl != null && currentUrl.toLowerCase().contains("internalcaptcha")) {
+            boolean solved = waitForManualCaptcha(webDriver);
+            if (solved) {
+                // Re-navigate to the detail page after captcha
+                webDriver.get(detailUrl);
+                try { Thread.sleep(2000); } catch (Exception ignored) {}
+            }
+            return solved;
+        }
+        String immediateHtml = pageHtml(webDriver);
+        if (isAccessRestricted(immediateHtml)) {
+            boolean restored = waitForAccessRestriction(webDriver);
+            if (restored) {
+                webDriver.get(detailUrl);
+                try { Thread.sleep(2000); } catch (Exception ignored) {}
+            }
+            return restored;
+        }
+
+        // Main poll loop — wait up to 45 s for content to appear
+        try {
+            WebDriverWait wait = new WebDriverWait(webDriver, Duration.ofSeconds(45));
+            wait.until((ExpectedCondition<Boolean>) d -> {
+                String url = d.getCurrentUrl();
+                String src = pageHtml(d);
+                if (src == null) return false;
+                // Break out immediately if we hit any blocking state
+                if (isCaptchaPage(src, url)) return true;
+                if (isAccessRestricted(src)) return true;
+                boolean hasContent = src.contains("card-summary")
+                        || src.contains("card-block")
+                        || src.contains("data-link");
+                return hasContent;
+            });
+        } catch (Exception ignored) {}
+
+        // Render buffer — give DOM time to finish updating
+        try { Thread.sleep(2000); } catch (Exception ignored) {}
+
+        String currentUrl2 = webDriver.getCurrentUrl();
+        String src = pageHtml(webDriver);
+
+        // Handle access restriction
+        if (isAccessRestricted(src)) {
+            System.out.println("  Access restricted on detail page.");
+            boolean restored = waitForAccessRestriction(webDriver);
+            if (restored) {
+                webDriver.get(detailUrl);
+                try { Thread.sleep(2000); } catch (Exception ignored) {}
+            }
+            return restored;
+        }
+
+        // Handle any captcha type (redirect OR inline Cloudflare OR TPS internal)
+        if (isCaptchaPage(src, currentUrl2)) {
+            System.out.println();
+            System.out.println("  *** CAPTCHA REQUIRED ***");
+            System.out.println("  TruePeopleSearch has shown a captcha in the browser window.");
+            System.out.println("  Please solve it manually. The program will resume automatically.");
+            System.out.println("  Waiting up to 3 minutes...");
+            System.out.println();
+            try {
+                WebDriverWait captchaWait = new WebDriverWait(webDriver, Duration.ofMinutes(3));
+                captchaWait.until((ExpectedCondition<Boolean>) d -> {
+                    String u = d.getCurrentUrl();
+                    String s = pageHtml(d);
+                    if (s == null) return false;
+                    // Break out on access restriction so we can handle it
+                    if (isAccessRestricted(s)) return true;
+                    // Still on captcha — keep waiting
+                    if (isCaptchaPage(s, u)) return false;
+                    // Captcha is gone — success regardless of whether cards have loaded yet
+                    return true;
+                });
+                // Brief pause to let the post-captcha page finish rendering
+                try { Thread.sleep(2000); } catch (Exception ignored) {}
+                String postSrc = pageHtml(webDriver);
+                if (isAccessRestricted(postSrc)) {
+                    System.out.println("  Access restricted after captcha.");
+                    return waitForAccessRestriction(webDriver);
+                }
+                System.out.println("  Captcha solved — resuming.");
+                return true;
+            } catch (Exception ex) {
+                System.out.println("  Captcha not solved within 3 minutes; scraping whatever is present.");
+                return false;
+            }
+        }
+
+        boolean hasContent = src != null
+                && (src.contains("card-summary") || src.contains("card-block") || src.contains("data-link"));
+        if (!hasContent) {
+            System.out.println("  Detail page timed out; scraping whatever is present.");
+        }
+        return hasContent;
+    }
+
+    // ── Name cleaning ─────────────────────────────────────────────────────────
+
+    static String cleanName(String raw) {
+        if (raw == null) return "";
+        String name = raw.trim();
+
+        String[] lines = name.split("\\r?\\n");
+        String firstLine = lines[0].trim();
+        String coName = null;
+        for (String line : lines) {
+            Matcher m = CO_PATTERN.matcher(line.trim());
+            if (m.matches()) {
+                coName = m.group(1).trim();
+                break;
+            }
+        }
+
+        if (coName != null) {
+            name = coName;
+        } else {
+            name = firstLine;
+        }
+
+        name = AKA_PATTERN.matcher(name).replaceAll("").trim();
+        name = AND_PATTERN.matcher(name).replaceAll("").trim();
+        name = ENTITY_SUFFIX_PATTERN.matcher(name).replaceAll("").trim();
+        name = ENTITY_PREFIX_PATTERN.matcher(name).replaceAll("").trim();
+        name = SUFFIX_PATTERN.matcher(name).replaceAll("").trim();
+
+        if (name.contains("&")) {
+            name = name.split("&")[0].trim();
+        }
+
+        return name;
+    }
+
+    // ── Captcha / rate-limit handling ─────────────────────────────────────────
+
+    /** Returns true if the page HTML or URL indicates TPS has blocked access. */
+    private static boolean isAccessRestricted(String src) {
+        if (src == null) return false;
+        return src.contains("Access is temporarily restricted")
+                || src.contains("temporarily restricted")
+                || src.contains("Automated (bot) activity")
+                || src.contains("rate-limited")          // /ratelimited page
+                || src.contains("Rate Limited")          // /ratelimited page title
+                || src.contains("ratelimited")           // URL in page source
+                || src.contains("IP address has been temporarily");
+    }
+
+    /** Returns true if the current URL is a known TPS block/rate-limit page. */
+    private static boolean isBlockedUrl(WebDriver d) {
+        try {
+            String url = d.getCurrentUrl();
+            if (url == null) return false;
+            return url.toLowerCase().contains("ratelimited")
+                    || url.toLowerCase().contains("internalcaptcha")
+                    || url.toLowerCase().contains("captchasubmit");
         } catch (Exception e) {
             return false;
         }
     }
 
     /**
-     * Tear down the current session and start a fresh one.
+     * Returns true if the page is showing any kind of captcha challenge —
+     * either a Cloudflare Turnstile widget or TPS's own internal captcha form.
+     * This catches cases where the captcha is rendered inline on the page
+     * rather than via a URL redirect to /internalcaptcha.
      */
-    private static void reinitialize() {
-        System.out.println("  Reinitializing browser session...");
-        shutdown();
-        initialize();
+    private static boolean isCaptchaPage(String src, String url) {
+        if (url != null && url.toLowerCase().contains("internalcaptcha")) return true;
+        if (src == null) return false;
+        return src.contains("cf-turnstile-response")
+                || src.toLowerCase().contains("internalcaptcha")
+                || src.contains("captchasubmit")
+                || src.contains("rrstamp");   // TPS rate-limit stamp present in captcha pages
     }
 
-    /**
-     * Search TruePeopleSearch for the given name and city/state
-     * using the shared browser session.
-     */
-    public static PersonContact search(String name, String city, String state) {
-        if (!initialized || !isSessionAlive()) {
-            if (initialized) {
-                System.out.println("  Browser session is dead, restarting...");
-            }
-            reinitialize();
-        }
+    private static boolean waitForResultsPage(WebDriver webDriver) {
+        // Brief pause for initial page render (PageLoadStrategy.NONE returns before DOM is ready)
+        try { Thread.sleep(1500); } catch (Exception ignored) {}
 
-        PersonContact result = new PersonContact();
-        List<String> resultLinks = new ArrayList<>();
+        // Check immediately for known block states before starting the wait loop
+        String currentUrl = webDriver.getCurrentUrl();
+        String immediateHtml = pageHtml(webDriver);
+        // Check URL first — /ratelimited is a hard block distinct from captcha
+        if (isBlockedUrl(webDriver) || isAccessRestricted(immediateHtml)) {
+            // Distinguish rate-limit (needs long wait) from captcha (needs human solve)
+            if (currentUrl != null && currentUrl.toLowerCase().contains("ratelimited")) {
+                return waitForAccessRestriction(webDriver);
+            }
+            if (isCaptchaPage(immediateHtml, currentUrl)) {
+                return waitForManualCaptcha(webDriver);
+            }
+            return waitForAccessRestriction(webDriver);
+        }
+        if (isCaptchaPage(immediateHtml, currentUrl)) {
+            return waitForManualCaptcha(webDriver);
+        }
 
         try {
-            // ── Step 1: Build search URL and navigate directly ──────────
-            String encodedName = java.net.URLEncoder.encode(name, "UTF-8");
-            String encodedLocation = java.net.URLEncoder.encode(city + ", " + state, "UTF-8");
-            String searchUrl = BASE_LINK + "results?name=" + encodedName
-                    + "&citystatezip=" + encodedLocation;
+            WebDriverWait wait = new WebDriverWait(webDriver, Duration.ofSeconds(45));
+            wait.until((ExpectedCondition<Boolean>) d -> {
+                String url = d.getCurrentUrl();
+                String src = pageHtml(d);
+                if (src == null) return false;
+                // Break out immediately on any blocking state
+                if (url != null && url.toLowerCase().contains("ratelimited")) return true;
+                if (isCaptchaPage(src, url)) return true;
+                if (isAccessRestricted(src)) return true;
+                return src.contains("data-detail-link");
+            });
+        } catch (Exception ignored) {}
 
-            page.navigate(searchUrl, new Page.NavigateOptions()
-                    .setWaitUntil(WaitUntilState.DOMCONTENTLOADED)
-                    .setTimeout(60000));
+        // Give the page a moment to finish rendering before final checks.
+        try { Thread.sleep(2000); } catch (Exception ignored) {}
 
-            // Wait for any CAPTCHAs on the results page
-            waitForHumanVerification(page, "results");
-            humanDelay(2000, 5000);
+        String finalUrl = webDriver.getCurrentUrl();
+        String src = pageHtml(webDriver);
 
-            System.out.println("  Results URL: " + page.url());
-            System.out.println("  Results title: " + page.title());
+        if (finalUrl != null && finalUrl.toLowerCase().contains("ratelimited")) {
+            return waitForAccessRestriction(webDriver);
+        }
+        if (isCaptchaPage(src, finalUrl)) {
+            return waitForManualCaptcha(webDriver);
+        }
+        if (isAccessRestricted(src)) {
+            return waitForAccessRestriction(webDriver);
+        }
+        if (src != null && src.contains("data-detail-link")) return true;
+        if (src != null && src.contains("No results found")) {
+            System.out.println("  TPS returned no results for this search.");
+            return false;
+        }
 
-            // Parse results
-            String html = page.content();
-            Document doc = Jsoup.parse(html);
+        // Log a snippet of the actual page so we can diagnose unknown states
+        String snippetText = src != null
+                ? src.replaceAll("<[^>]+>", " ").replaceAll("\s+", " ").trim()
+                : "(null)";
+        String snippet = snippetText.length() > 300 ? snippetText.substring(0, 300) : snippetText;
+        System.out.println("  Page did not reach expected state.");
+        System.out.println("  Current URL: " + webDriver.getCurrentUrl());
+        System.out.println("  Page text preview: " + snippet);
+        return false;
+    }
 
-            // Find result cards
-            Elements cards = doc.select("[data-detail-link]");
-            String cityState = city + ", " + state;
-            for (Element card : cards) {
-                String text = card.text();
-                if (text != null && text.contains(cityState)) {
-                    String detailLink = card.attr("data-detail-link");
-                    if (detailLink != null && !detailLink.isEmpty()) {
-                        resultLinks.add(BASE_LINK + detailLink);
-                    }
-                }
-            }
+    /**
+     * TPS has shown "Access is temporarily restricted" — the IP has been flagged.
+     * We pause for a long cooldown (10 minutes) then ask the user to retry manually.
+     * The program will attempt to resume after the cooldown.
+     */
+    private static boolean waitForAccessRestriction(WebDriver webDriver) {
+        System.out.println();
+        System.out.println("  *** ACCESS TEMPORARILY RESTRICTED / RATE LIMITED ***");
+        System.out.println("  TruePeopleSearch has blocked this session (IP rate-limited or flagged).");
+        System.out.println("  Waiting up to 10 minutes for the restriction to lift automatically...");
+        System.out.println("  You can also navigate to truepeoplesearch.com manually in the browser.");
+        System.out.println("  The program will resume automatically when results become available.");
+        System.out.println();
 
-            // Fallback: try links containing /find/person/
-            if (resultLinks.isEmpty()) {
-                Elements personLinks = doc.select("a[href*='/find/person/']");
-                for (Element link : personLinks) {
-                    String href = link.attr("href");
-                    if (href != null && !href.isEmpty()) {
-                        String fullUrl = href.startsWith("http") ? href : BASE_LINK + href.replaceFirst("^/", "");
-                        if (!resultLinks.contains(fullUrl)) {
-                            resultLinks.add(fullUrl);
-                        }
-                    }
-                }
-            }
-
-            System.out.println("  Found persons: " + resultLinks.size());
-
+        try {
+            // Wait up to 10 minutes for the restriction to clear and results to appear
+            WebDriverWait longWait = new WebDriverWait(webDriver, Duration.ofMinutes(10));
+            longWait.until((ExpectedCondition<Boolean>) d -> {
+                String src = pageHtml(d);
+                if (src == null) return false;
+                // Keep waiting while restricted
+                if (isAccessRestricted(src)) return false;
+                // Also keep waiting if on captcha page
+                String url = d.getCurrentUrl();
+                if (url != null && url.toLowerCase().contains("internalcaptcha")) return false;
+                boolean challengeOnly = src.contains("cf-turnstile-response")
+                        && !src.contains("data-detail-link");
+                return !challengeOnly && src.contains("data-detail-link");
+            });
+            System.out.println("  Access restored — resuming.");
+            return true;
         } catch (Exception ex) {
-            System.out.println("  Error during search: " + ex.getMessage());
-            // If the browser died, mark session as dead so next call reinitializes
-            if (!isSessionAlive()) {
-                System.out.println("  Browser session lost — will reinitialize on next search.");
-                initialized = false;
-            }
+            System.out.println("  Access was not restored within 10 minutes. Skipping this row.");
+            return false;
         }
-
-        // ── Step 2: Visit each detail link and scrape phones/emails ─────
-        Set<String> foundPhones = new LinkedHashSet<>();
-        Set<String> foundEmails = new LinkedHashSet<>();
-
-        for (String link : resultLinks) {
-            try {
-                System.out.println("  Visiting: " + link);
-                page.navigate(link, new Page.NavigateOptions()
-                        .setWaitUntil(WaitUntilState.DOMCONTENTLOADED)
-                        .setTimeout(60000));
-
-                waitForHumanVerification(page, "detail");
-                humanDelay(2000, 5000);
-
-                String html = page.content();
-                Document doc = Jsoup.parse(html);
-                String pageText = doc.body().text();
-
-                // Extract phone numbers
-                Matcher pm = PHONE_PATTERN.matcher(pageText);
-                while (pm.find()) {
-                    foundPhones.add(pm.group());
-                }
-
-                // Extract emails (exclude support email)
-                Matcher em = EMAIL_PATTERN.matcher(pageText);
-                while (em.find()) {
-                    String email = em.group();
-                    if (!"support@truepeoplesearch.com".equalsIgnoreCase(email)) {
-                        foundEmails.add(email);
-                    }
-                }
-
-            } catch (Exception ex) {
-                System.out.println("  Error on detail page: " + ex.getMessage());
-                if (!isSessionAlive()) {
-                    System.out.println("  Browser session lost — skipping remaining detail pages.");
-                    initialized = false;
-                    break;
-                }
-            }
-        }
-
-        result.phones.addAll(foundPhones);
-        result.emails.addAll(foundEmails);
-        return result;
     }
 
-    // ── Helper methods ──────────────────────────────────────────────────────
+    private static boolean waitForManualCaptcha(WebDriver webDriver) {
+        System.out.println();
+        System.out.println("  *** CAPTCHA REQUIRED ***");
+        System.out.println("  TruePeopleSearch has shown a captcha in the browser window.");
+        System.out.println("  Please solve it manually. The program will resume automatically.");
+        System.out.println("  Waiting up to 3 minutes...");
+        System.out.println();
 
-    /**
-     * Returns true only for errors that mean the browser/page is gone for good.
-     */
-    private static boolean isFatalBrowserError(PlaywrightException e) {
-        String msg = e.getMessage();
-        if (msg == null) return false;
-        return msg.contains("Target page, context or browser has been closed")
-                || msg.contains("Browser has been closed")
-                || msg.contains("browser.newContext: Browser closed");
+        try {
+            WebDriverWait longWait = new WebDriverWait(webDriver, Duration.ofMinutes(3));
+            longWait.until((ExpectedCondition<Boolean>) d -> {
+                String url = d.getCurrentUrl();
+                String src = pageHtml(d);
+                if (src == null) return false;
+                // Break out on access restriction
+                if (isAccessRestricted(src)) return true;
+                // Still on captcha — keep waiting
+                if (isCaptchaPage(src, url)) return false;
+                // Captcha is gone — success
+                return true;
+            });
+            // Brief pause to let the post-captcha page finish rendering
+            try { Thread.sleep(2000); } catch (Exception ignored) {}
+            String postSrc = pageHtml(webDriver);
+            if (isAccessRestricted(postSrc)) {
+                System.out.println("  Access restricted after captcha.");
+                return waitForAccessRestriction(webDriver);
+            }
+            System.out.println("  Captcha solved — resuming.");
+            return true;
+        } catch (Exception ex) {
+            System.out.println("  Captcha was not solved within 3 minutes. Skipping this row.");
+            return false;
+        }
     }
 
-    private static void waitForHumanVerification(Page pg, String ctx) {
-        int maxWait = 60; // 60 * 2s = 120 seconds max
-        boolean prompted = false;
-        for (int i = 0; i < maxWait; i++) {
-            String title = "";
-            String bodyText = "";
+    // ── Helpers ───────────────────────────────────────────────────────────────
 
-            try {
-                // Let the page settle if it's mid-navigation
-                pg.waitForLoadState(com.microsoft.playwright.options.LoadState.DOMCONTENTLOADED,
-                        new Page.WaitForLoadStateOptions().setTimeout(5000));
-            } catch (PlaywrightException e) {
-                if (isFatalBrowserError(e)) throw e;
-                // timeout or navigation-in-progress — that's fine, we'll check what we can
-            }
+    private static String pageHtml(WebDriver d) {
+        try {
+            return (String) ((JavascriptExecutor) d)
+                    .executeScript("return document.documentElement.outerHTML;");
+        } catch (Exception e) {
+            return null;
+        }
+    }
 
-            try {
-                title = pg.title().toLowerCase();
-            } catch (PlaywrightException e) {
-                if (isFatalBrowserError(e)) throw e;
-                // "Execution context was destroyed" = page is navigating, treat as still blocked
-            }
-
-            try {
-                bodyText = pg.innerText("body").trim();
-            } catch (PlaywrightException e) {
-                if (isFatalBrowserError(e)) throw e;
-                // transient error during navigation
-            }
-
-            boolean isBlocked = title.isEmpty() // couldn't even read title — page is navigating
-                    || title.contains("just a moment")
-                    || title.contains("attention required")
-                    || title.contains("captcha challenge")
-                    || bodyText.contains("Verification Required")
-                    || bodyText.contains("Slide right to secure your access")
-                    || bodyText.contains("Access is temporarily restricted")
-                    || bodyText.contains("We detect unusual activity")
-                    || (bodyText.length() < 50 && title.equals("truepeoplesearch.com"));
-
-            if (!isBlocked) {
-                return; // Page is clear, proceed
-            }
-
-            if (!prompted) {
-                System.out.println("  ** CAPTCHA/verification detected on " + ctx
-                        + " — please solve it in the browser window **");
-                prompted = true;
-            }
-            if (i % 5 == 0 && i > 0) {
-                System.out.println("  Waiting for manual verification... (" + (i * 2) + "s)");
-            }
-
-            try {
-                pg.waitForTimeout(2000);
-            } catch (PlaywrightException e) {
-                if (isFatalBrowserError(e)) throw e;
+    private static String pctEncode(String value) {
+        if (value == null) return "";
+        StringBuilder sb = new StringBuilder();
+        for (char c : value.toCharArray()) {
+            if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+                    || (c >= '0' && c <= '9')
+                    || c == '-' || c == '_' || c == '.' || c == '~') {
+                sb.append(c);
+            } else if (c == ' ') {
+                sb.append('+');
+            } else {
+                try {
+                    byte[] bytes = String.valueOf(c).getBytes("UTF-8");
+                    for (byte b : bytes) sb.append(String.format("%%%02X", b & 0xFF));
+                } catch (Exception e) { /* skip */ }
             }
         }
-
-        System.out.println("  WARNING: Verification timeout after 120s, continuing anyway");
-    }
-
-    /**
-     * Random delay to mimic human behavior.
-     */
-    private static void humanDelay(int minMs, int maxMs) {
-        page.waitForTimeout(minMs + RANDOM.nextInt(maxMs - minMs));
+        return sb.toString();
     }
 }

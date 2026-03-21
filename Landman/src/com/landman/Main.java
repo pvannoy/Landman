@@ -17,7 +17,7 @@ import java.nio.file.Paths;
  */
 public class Main {
 
-    private static final int DEFAULT_DELAY = 5;
+    private static final int DEFAULT_DELAY = 30;
 
     public static void main(String[] args) {
         // Ensure Swing dialogs use the native OS look-and-feel
@@ -52,9 +52,6 @@ public class Main {
         System.out.println("Selected file: " + inputPath);
         System.out.println("Output will be written to: " + outputPath);
 
-        // ── Initialize the shared browser session (solve CAPTCHAs once) ─────
-        TruePeopleSearchScraper.initialize();
-
         // ── Process the Excel file ───────────────────────────────────────────
         try (FileInputStream fis = new FileInputStream(inputPath);
              Workbook workbook = new XSSFWorkbook(fis)) {
@@ -69,7 +66,7 @@ public class Main {
             for (int r = 0; r <= sheet.getLastRowNum(); r++) {
                 Row candidate = sheet.getRow(r);
                 if (candidate == null) continue;
-
+                
                 //TODO: Make the switch case-insensitive and ignore whitespace in header matching
                 for (int c = 0; c < candidate.getLastCellNum(); c++) {
                     Cell cell = candidate.getCell(c);
@@ -139,8 +136,25 @@ public class Main {
                 System.out.println("Searching for: " + name + ", " + city + ", " + state);
                 System.out.println("Searching in TruePeopleSearch...");
 
-                TruePeopleSearchScraper.PersonContact contact =
-                        TruePeopleSearchScraper.search(name, city, state);
+                // Retry loop — if the browser crashes mid-search, restart it and try once more.
+                TruePeopleSearchScraper.PersonContact contact = null;
+                int attempts = 0;
+                while (contact == null && attempts < 2) {
+                    attempts++;
+                    try {
+                        contact = TruePeopleSearchScraper.search(name, city, state);
+                    } catch (org.openqa.selenium.WebDriverException browserEx) {
+                        System.out.println("Browser died (attempt " + attempts + "): " + browserEx.getMessage().split("\n")[0]);
+                        if (attempts < 2) {
+                            System.out.println("Restarting browser and retrying row...");
+                            TruePeopleSearchScraper.restartDriver();
+                            Thread.sleep(3000);
+                        } else {
+                            System.out.println("Skipping row after browser failed twice.");
+                            contact = new TruePeopleSearchScraper.PersonContact();
+                        }
+                    }
+                }
 
                 String phonesStr = String.join("\n", contact.phones);
                 String emailsStr = String.join("\n", contact.emails);
@@ -150,6 +164,11 @@ public class Main {
 
                 System.out.println("Found phones(tps): " + contact.phones);
                 System.out.println("Found emails(tps): " + contact.emails);
+
+                // Save progress to disk after every row so a crash doesn't lose work
+                try (FileOutputStream fos = new FileOutputStream(outputPath)) {
+                    workbook.write(fos);
+                }
 
                 System.out.println("Sleeping for " + delay + " seconds...");
                 Thread.sleep(delay * 1000L);
@@ -162,6 +181,10 @@ public class Main {
             }
 
             System.out.println("Results written to: " + outputPath);
+
+            // Close the shared browser now that all rows have been processed
+            TruePeopleSearchScraper.quit();
+
             JOptionPane.showMessageDialog(null,
                     "Done! Results written to:\n" + outputPath,
                     "Complete", JOptionPane.INFORMATION_MESSAGE);
@@ -175,12 +198,11 @@ public class Main {
         } catch (Exception e) {
             System.err.println("Error: " + e.getMessage());
             e.printStackTrace(System.err);
+            TruePeopleSearchScraper.quit();
             JOptionPane.showMessageDialog(null,
                     "Error: " + e.getMessage(),
                     "Error", JOptionPane.ERROR_MESSAGE);
             System.exit(1);
-        } finally {
-            TruePeopleSearchScraper.shutdown();
         }
     }
 
