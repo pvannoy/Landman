@@ -17,7 +17,7 @@ import java.nio.file.Paths;
  */
 public class Main {
 
-    private static final int DEFAULT_DELAY = 30;
+    private static final int DEFAULT_DELAY = 45;
 
     public static void main(String[] args) {
         // Ensure Swing dialogs use the native OS look-and-feel
@@ -170,8 +170,12 @@ public class Main {
                     workbook.write(fos);
                 }
 
-                System.out.println("Sleeping for " + delay + " seconds...");
-                Thread.sleep(delay * 1000L);
+                // Add random jitter (±15 s) so requests don't arrive on a fixed interval.
+                // Fixed intervals are a strong bot signal; human browsing is irregular.
+                int jitter = (int)(Math.random() * 30) - 15;  // -15 to +15 seconds
+                int actualDelay = Math.max(20, delay + jitter); // never less than 20 s
+                System.out.println("Sleeping for " + actualDelay + " seconds...");
+                Thread.sleep(actualDelay * 1000L);
                 System.out.println("--------------------");
             }
 

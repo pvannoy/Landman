@@ -74,10 +74,10 @@ public class TruePeopleSearchScraper {
     // ─────────────────────────────────────────────────────────────────────────
 
     private static final boolean PROXY_ENABLED  = false;
-    private static final String  PROXY_HOST     = "proxy.proxyrack.net";
+    private static final String  PROXY_HOST     = "premium.residential.proxyrack.net";
     private static final int     PROXY_PORT     = 10000;
-    private static final String  PROXY_USERNAME = "YOUR_PROXYRACK_USERNAME";
-    private static final String  PROXY_PASSWORD = "YOUR_PROXYRACK_PASSWORD";
+    private static final String  PROXY_USERNAME = "gefabebibozasu-country-US";
+    private static final String  PROXY_PASSWORD = "TJEZYCE-6CBC90A-NUMCLFK-QVADQS7-7YK3VAU-UCFS8QQ-PCHOUQJ";
 
     // ── Patterns ──────────────────────────────────────────────────────────────
 
@@ -271,93 +271,19 @@ public class TruePeopleSearchScraper {
 
         // ── Proxy (set PROXY_ENABLED = true and fill in credentials above) ───
         if (PROXY_ENABLED) {
-            // Route all browser traffic through the ProxyRack residential proxy.
-            // Username:password authentication is handled via a local proxy extension
-            // injected into the browser at launch so Chrome can authenticate silently.
-            String proxyExtPath = buildProxyAuthExtension();
-            if (proxyExtPath != null) {
-                opts.addArguments("--proxy-server=http://" + PROXY_HOST + ":" + PROXY_PORT);
-                opts.addExtensions(new java.io.File(proxyExtPath));
-                System.out.println("  Proxy enabled: " + PROXY_HOST + ":" + PROXY_PORT
-                        + " (user: " + PROXY_USERNAME + ")");
-            } else {
-                // Extension build failed — fall back to unauthenticated proxy
-                // (will only work if ProxyRack allows IP-whitelisted connections)
-                opts.addArguments("--proxy-server=http://" + PROXY_HOST + ":" + PROXY_PORT);
-                System.out.println("  Proxy enabled (no auth extension): " + PROXY_HOST + ":" + PROXY_PORT);
-            }
+            // Embed credentials directly in the proxy URL using the standard
+            // http://user:pass@host:port format. Chrome 130+ supports this format
+            // reliably without needing an extension for authentication.
+            String proxyUrl = "http://" + PROXY_USERNAME + ":" + PROXY_PASSWORD
+                    + "@" + PROXY_HOST + ":" + PROXY_PORT;
+            opts.addArguments("--proxy-server=" + proxyUrl);
+            // Tell Chrome to use the proxy for all traffic including localhost
+            opts.addArguments("--proxy-bypass-list=<-loopback>");
+            System.out.println("  Proxy enabled: " + PROXY_HOST + ":" + PROXY_PORT
+                    + " (user: " + PROXY_USERNAME + ")");
         }
 
         return opts;
-    }
-
-    /**
-     * Builds a tiny Chrome extension that handles proxy authentication silently.
-     * Chrome blocks the proxy auth dialog in automated sessions, so we inject
-     * the credentials via a background script instead.
-     *
-     * The extension is written to a temp zip file and returned as a path string.
-     * Returns null if the extension could not be created.
-     */
-    private static String buildProxyAuthExtension() {
-        try {
-            // background.js — intercepts proxy auth challenges and supplies credentials
-            String backgroundJs = String.format("""
-                    var config = {
-                        mode: "fixed_servers",
-                        rules: {
-                            singleProxy: {
-                                scheme: "http",
-                                host: "%s",
-                                port: %d
-                            },
-                            bypassList: ["localhost"]
-                        }
-                    };
-                    chrome.proxy.settings.set({value: config, scope: "regular"}, function(){});
-                    chrome.webRequest.onAuthRequired.addListener(
-                        function(details) {
-                            return { authCredentials: { username: "%s", password: "%s" } };
-                        },
-                        {urls: ["<all_urls>"]},
-                        ["blocking"]
-                    );
-                    """, PROXY_HOST, PROXY_PORT, PROXY_USERNAME, PROXY_PASSWORD);
-
-            // manifest.json — declares the permissions the background script needs
-            String manifestJson = """
-                    {
-                        "version": "1.0.0",
-                        "manifest_version": 2,
-                        "name": "ProxyAuth",
-                        "permissions": [
-                            "proxy", "tabs", "unlimitedStorage", "storage",
-                            "<all_urls>", "webRequest", "webRequestBlocking"
-                        ],
-                        "background": { "scripts": ["background.js"] },
-                        "minimum_chrome_version": "76.0.0"
-                    }
-                    """;
-
-            // Write both files into a zip (Chrome extension format)
-            java.nio.file.Path extDir = java.nio.file.Files.createTempDirectory("proxyext");
-            java.nio.file.Path zipPath = extDir.resolve("proxy_auth.zip");
-
-            try (java.util.zip.ZipOutputStream zos = new java.util.zip.ZipOutputStream(
-                    new java.io.FileOutputStream(zipPath.toFile()))) {
-                zos.putNextEntry(new java.util.zip.ZipEntry("background.js"));
-                zos.write(backgroundJs.getBytes(java.nio.charset.StandardCharsets.UTF_8));
-                zos.closeEntry();
-                zos.putNextEntry(new java.util.zip.ZipEntry("manifest.json"));
-                zos.write(manifestJson.getBytes(java.nio.charset.StandardCharsets.UTF_8));
-                zos.closeEntry();
-            }
-
-            return zipPath.toString();
-        } catch (Exception e) {
-            System.out.println("  Could not build proxy auth extension: " + e.getMessage());
-            return null;
-        }
     }
 
     /**
@@ -464,6 +390,26 @@ public class TruePeopleSearchScraper {
                 devTools.createSession();
                 devTools.send(Page.addScriptToEvaluateOnNewDocument(STEALTH_SCRIPT, null, null, null));
                 System.out.println("CDP stealth script injected successfully.");
+
+                // ── Inject Proxy-Authorization header via CDP ──────────────────
+                // Chrome sometimes ignores credentials embedded in --proxy-server URL.
+                // Setting the header directly via CDP Network.setExtraHTTPHeaders
+                // ensures every request carries the proxy auth token.
+                if (PROXY_ENABLED) {
+                    try {
+                        String credentials = PROXY_USERNAME + ":" + PROXY_PASSWORD;
+                        String encoded = java.util.Base64.getEncoder()
+                                .encodeToString(credentials.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                        devTools.send(org.openqa.selenium.devtools.v144.network.Network.enable(
+                                java.util.Optional.empty(), java.util.Optional.empty(), java.util.Optional.empty(), java.util.Optional.empty(), java.util.Optional.empty()));
+                        devTools.send(org.openqa.selenium.devtools.v144.network.Network.setExtraHTTPHeaders(
+                                new org.openqa.selenium.devtools.v144.network.model.Headers(
+                                        java.util.Map.of("Proxy-Authorization", "Basic " + encoded))));
+                        System.out.println("  Proxy-Authorization header injected via CDP.");
+                    } catch (Exception proxyEx) {
+                        System.out.println("  CDP proxy auth header skipped: " + proxyEx.getMessage());
+                    }
+                }
             } catch (Exception e) {
                 System.out.println("CDP stealth injection skipped (" + e.getMessage() + "); using JS fallback.");
                 try {
@@ -542,7 +488,7 @@ public class TruePeopleSearchScraper {
 
         // ── Step 3: Wait for results page ────────────────────────────────────
         System.out.println("Waiting for results page...");
-        boolean resultsReady = waitForResultsPage(webDriver);
+        boolean resultsReady = waitForResultsPage(webDriver, resultsUrl);
         if (!resultsReady) {
             System.out.println("  Skipping row — results page did not load.");
             return result;
@@ -634,12 +580,7 @@ public class TruePeopleSearchScraper {
         }
         String immediateHtml = pageHtml(webDriver);
         if (isAccessRestricted(immediateHtml)) {
-            boolean restored = waitForAccessRestriction(webDriver);
-            if (restored) {
-                webDriver.get(detailUrl);
-                try { Thread.sleep(2000); } catch (Exception ignored) {}
-            }
-            return restored;
+            return waitForAccessRestriction(webDriver, detailUrl);
         }
 
         // Main poll loop — wait up to 45 s for content to appear
@@ -668,12 +609,7 @@ public class TruePeopleSearchScraper {
         // Handle access restriction
         if (isAccessRestricted(src)) {
             System.out.println("  Access restricted on detail page.");
-            boolean restored = waitForAccessRestriction(webDriver);
-            if (restored) {
-                webDriver.get(detailUrl);
-                try { Thread.sleep(2000); } catch (Exception ignored) {}
-            }
-            return restored;
+            return waitForAccessRestriction(webDriver, detailUrl);
         }
 
         // Handle any captcha type (redirect OR inline Cloudflare OR TPS internal)
@@ -702,7 +638,7 @@ public class TruePeopleSearchScraper {
                 String postSrc = pageHtml(webDriver);
                 if (isAccessRestricted(postSrc)) {
                     System.out.println("  Access restricted after captcha.");
-                    return waitForAccessRestriction(webDriver);
+                    return waitForAccessRestriction(webDriver, detailUrl);
                 }
                 System.out.println("  Captcha solved — resuming.");
                 return true;
@@ -798,7 +734,7 @@ public class TruePeopleSearchScraper {
                 || src.contains("rrstamp");   // TPS rate-limit stamp present in captcha pages
     }
 
-    private static boolean waitForResultsPage(WebDriver webDriver) {
+    private static boolean waitForResultsPage(WebDriver webDriver, String targetUrl) {
         // Brief pause for initial page render (PageLoadStrategy.NONE returns before DOM is ready)
         try { Thread.sleep(1500); } catch (Exception ignored) {}
 
@@ -807,14 +743,10 @@ public class TruePeopleSearchScraper {
         String immediateHtml = pageHtml(webDriver);
         // Check URL first — /ratelimited is a hard block distinct from captcha
         if (isBlockedUrl(webDriver) || isAccessRestricted(immediateHtml)) {
-            // Distinguish rate-limit (needs long wait) from captcha (needs human solve)
-            if (currentUrl != null && currentUrl.toLowerCase().contains("ratelimited")) {
-                return waitForAccessRestriction(webDriver);
-            }
             if (isCaptchaPage(immediateHtml, currentUrl)) {
                 return waitForManualCaptcha(webDriver);
             }
-            return waitForAccessRestriction(webDriver);
+            return waitForAccessRestriction(webDriver, targetUrl);
         }
         if (isCaptchaPage(immediateHtml, currentUrl)) {
             return waitForManualCaptcha(webDriver);
@@ -841,13 +773,13 @@ public class TruePeopleSearchScraper {
         String src = pageHtml(webDriver);
 
         if (finalUrl != null && finalUrl.toLowerCase().contains("ratelimited")) {
-            return waitForAccessRestriction(webDriver);
+            return waitForAccessRestriction(webDriver, targetUrl);
         }
         if (isCaptchaPage(src, finalUrl)) {
             return waitForManualCaptcha(webDriver);
         }
         if (isAccessRestricted(src)) {
-            return waitForAccessRestriction(webDriver);
+            return waitForAccessRestriction(webDriver, targetUrl);
         }
         if (src != null && src.contains("data-detail-link")) return true;
         if (src != null && src.contains("No results found")) {
@@ -867,40 +799,89 @@ public class TruePeopleSearchScraper {
     }
 
     /**
-     * TPS has shown "Access is temporarily restricted" — the IP has been flagged.
-     * We pause for a long cooldown (10 minutes) then ask the user to retry manually.
-     * The program will attempt to resume after the cooldown.
+     * TPS has rate-limited or restricted this IP.
+     *
+     * Strategy:
+     *   1. Wait up to 15 minutes, polling every 10 seconds, for the block page to clear.
+     *   2. Once the block page is gone, re-navigate to the original targetUrl.
+     *   3. Wait up to 45 seconds for results to appear at that URL.
+     *
+     * The targetUrl parameter is the page we were trying to load when blocked.
+     * Pass null to skip re-navigation (e.g. when called from detail page handler).
      */
-    private static boolean waitForAccessRestriction(WebDriver webDriver) {
+    private static boolean waitForAccessRestriction(WebDriver webDriver, String targetUrl) {
         System.out.println();
         System.out.println("  *** ACCESS TEMPORARILY RESTRICTED / RATE LIMITED ***");
         System.out.println("  TruePeopleSearch has blocked this session (IP rate-limited or flagged).");
-        System.out.println("  Waiting up to 10 minutes for the restriction to lift automatically...");
-        System.out.println("  You can also navigate to truepeoplesearch.com manually in the browser.");
-        System.out.println("  The program will resume automatically when results become available.");
+        System.out.println("  Waiting up to 15 minutes for the restriction to lift...");
+        System.out.println("  The program will re-navigate and resume automatically.");
         System.out.println();
 
-        try {
-            // Wait up to 10 minutes for the restriction to clear and results to appear
-            WebDriverWait longWait = new WebDriverWait(webDriver, Duration.ofMinutes(10));
-            longWait.until((ExpectedCondition<Boolean>) d -> {
-                String src = pageHtml(d);
-                if (src == null) return false;
-                // Keep waiting while restricted
-                if (isAccessRestricted(src)) return false;
-                // Also keep waiting if on captcha page
-                String url = d.getCurrentUrl();
-                if (url != null && url.toLowerCase().contains("internalcaptcha")) return false;
-                boolean challengeOnly = src.contains("cf-turnstile-response")
-                        && !src.contains("data-detail-link");
-                return !challengeOnly && src.contains("data-detail-link");
-            });
-            System.out.println("  Access restored — resuming.");
-            return true;
-        } catch (Exception ex) {
-            System.out.println("  Access was not restored within 10 minutes. Skipping this row.");
+        // Phase 1: Wait for the block page itself to go away (up to 15 minutes).
+        // We poll every 10 seconds rather than using WebDriverWait's 500ms polling
+        // to avoid hammering TPS while blocked — that makes bans last longer.
+        boolean blockCleared = false;
+        long deadline = System.currentTimeMillis() + (15 * 60 * 1000L);
+        while (System.currentTimeMillis() < deadline) {
+            try { Thread.sleep(10_000); } catch (Exception ignored) {}
+            String src = pageHtml(webDriver);
+            String url = webDriver.getCurrentUrl();
+            if (src == null) continue;
+            // Still blocked?
+            if (isAccessRestricted(src)) continue;
+            if (url != null && (url.toLowerCase().contains("ratelimited")
+                    || url.toLowerCase().contains("internalcaptcha"))) continue;
+            // Block page is gone
+            blockCleared = true;
+            System.out.println("  Block page cleared — re-navigating...");
+            break;
+        }
+
+        if (!blockCleared) {
+            System.out.println("  Block did not clear within 15 minutes. Skipping this row.");
             return false;
         }
+
+        // Phase 2: Re-navigate to the target URL (the page we were originally trying to load).
+        if (targetUrl != null) {
+            try {
+                // Extra pause before re-navigating — give TPS time to fully lift the block
+                Thread.sleep(5000);
+                webDriver.get(targetUrl);
+                System.out.println("  Re-navigated to: " + targetUrl);
+
+                // Wait up to 45 s for results to appear
+                WebDriverWait resumeWait = new WebDriverWait(webDriver, Duration.ofSeconds(45));
+                resumeWait.until((ExpectedCondition<Boolean>) d -> {
+                    String src = pageHtml(d);
+                    String url = d.getCurrentUrl();
+                    if (src == null) return false;
+                    if (isAccessRestricted(src)) return true;   // re-blocked — break out
+                    if (isCaptchaPage(src, url)) return true;   // captcha — break out
+                    return src.contains("data-detail-link") || src.contains("card-summary")
+                            || src.contains("card-block");
+                });
+
+                String postSrc = pageHtml(webDriver);
+                String postUrl = webDriver.getCurrentUrl();
+                if (isAccessRestricted(postSrc) || (postUrl != null && postUrl.contains("ratelimited"))) {
+                    System.out.println("  Re-blocked immediately after restriction cleared. Skipping row.");
+                    return false;
+                }
+                if (isCaptchaPage(postSrc, postUrl)) {
+                    System.out.println("  Captcha appeared after restriction cleared.");
+                    return waitForManualCaptcha(webDriver);
+                }
+                System.out.println("  Access restored — resuming.");
+                return true;
+            } catch (Exception ex) {
+                System.out.println("  Re-navigation failed: " + ex.getMessage());
+                return false;
+            }
+        }
+
+        System.out.println("  Access restored — resuming.");
+        return true;
     }
 
     private static boolean waitForManualCaptcha(WebDriver webDriver) {
@@ -929,9 +910,13 @@ public class TruePeopleSearchScraper {
             String postSrc = pageHtml(webDriver);
             if (isAccessRestricted(postSrc)) {
                 System.out.println("  Access restricted after captcha.");
-                return waitForAccessRestriction(webDriver);
+                // No target URL available here — caller will handle re-navigation
+                return waitForAccessRestriction(webDriver, null);
             }
-            System.out.println("  Captcha solved — resuming.");
+            // Extra pause after captcha solve — TPS is already suspicious of this session.
+            // A brief cooldown reduces the chance of hitting rate limiting immediately.
+            System.out.println("  Captcha solved — pausing 15 seconds before resuming...");
+            try { Thread.sleep(15_000); } catch (Exception ignored) {}
             return true;
         } catch (Exception ex) {
             System.out.println("  Captcha was not solved within 3 minutes. Skipping this row.");
