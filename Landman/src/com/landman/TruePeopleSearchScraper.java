@@ -15,8 +15,6 @@ import org.openqa.selenium.WebDriver;
 import org.openqa.selenium.WebElement;
 import org.openqa.selenium.chrome.ChromeDriver;
 import org.openqa.selenium.chrome.ChromeOptions;
-import org.openqa.selenium.devtools.DevTools;
-import org.openqa.selenium.devtools.v144.page.Page;
 import org.openqa.selenium.support.ui.ExpectedCondition;
 import org.openqa.selenium.support.ui.ExpectedConditions;
 import org.openqa.selenium.support.ui.WebDriverWait;
@@ -79,11 +77,21 @@ public class TruePeopleSearchScraper {
     private static final String  PROXY_USERNAME = "gefabebibozasu-country-US";
     private static final String  PROXY_PASSWORD = "TJEZYCE-6CBC90A-NUMCLFK-QVADQS7-7YK3VAU-UCFS8QQ-PCHOUQJ";
 
+    /**
+     * Thrown when TruePeopleSearch has banned this IP and the ban did not lift
+     * within the 15-minute wait period. Main.java catches this to save all
+     * progress collected so far and exit cleanly so the user can resume later.
+     */
+    @SuppressWarnings("serial")
+	public static class IpBanException extends Exception {
+        public IpBanException(String message) { super(message); }
+    }
+
     // ── Patterns ──────────────────────────────────────────────────────────────
 
-    /** US phone numbers: (555) 123-4567, 555-123-4567, 5551234567 */
+    /** US phone numbers in (XXX) XXX-XXXX format only — e.g. (405) 947-4673 */
     private static final Pattern PHONE_PATTERN =
-            Pattern.compile("(\\(?\\d{3}\\)?[-.\\s]?\\d{3}[-.\\s]?\\d{4})");
+            Pattern.compile("(\\(\\d{3}\\)\\s\\d{3}-\\d{4})");
 
     /** Email addresses */
     private static final Pattern EMAIL_PATTERN =
@@ -160,6 +168,35 @@ public class TruePeopleSearchScraper {
                 if (parameter === 37446) return 'Intel Iris OpenGL Engine';
                 return getParameter.call(this, parameter);
             };
+
+            // 7. DataDome-specific: mask automation timing signatures
+            // DataDome measures time between events — add realistic variance
+            const _setTimeout = window.setTimeout;
+            window.setTimeout = function(fn, delay, ...args) {
+                return _setTimeout(fn, delay + Math.random() * 10, ...args);
+            };
+
+            // 8. DataDome: fix hairline property (automation marker)
+            Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
+            Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
+
+            // 9. DataDome: fix connection API
+            if (navigator.connection) {
+                Object.defineProperty(navigator.connection, 'rtt', { get: () => 100 });
+            }
+
+            // 10. DataDome: prevent detection via toString fingerprinting
+            // DataDome checks if native functions have been tampered with
+            const _getParameter = WebGLRenderingContext.prototype.getParameter;
+            if (_getParameter.toString().indexOf('native code') === -1) {
+                Object.defineProperty(WebGLRenderingContext.prototype.getParameter, 'toString', {
+                    value: () => 'function getParameter() { [native code] }'
+                });
+            }
+
+            // 11. Spoof screen properties to match a real monitor
+            Object.defineProperty(screen, 'colorDepth', { get: () => 24 });
+            Object.defineProperty(screen, 'pixelDepth', { get: () => 24 });
             """;
 
     // ── Shared WebDriver singleton ────────────────────────────────────────────
@@ -294,7 +331,9 @@ public class TruePeopleSearchScraper {
      *
      * Returns the path to the temp user-data-dir, or null if the copy failed.
      */
-    private static String buildSeleniumProfile() {
+    //Currently unused — we switched to a fresh profile strategy after DataDome started fingerprinting the profile itself across sessions. Keeping this method in case we want to try a hybrid approach in the future (copy cookies into a fresh temp profile each run).
+    @SuppressWarnings("unused")
+	private static String buildSeleniumProfile() {
         try {
             String localAppData = System.getenv("LOCALAPPDATA");
             java.nio.file.Path realDefault = java.nio.file.Paths.get(
@@ -348,70 +387,43 @@ public class TruePeopleSearchScraper {
 
             killExistingChrome();
 
-            // ── Strategy 1: Selenium-owned profile with real cookies copied in ─
-            // Copying just the Cookies file (not the whole profile) avoids the
-            // session-restore / crash-dialog conflicts that cause DevToolsActivePort
-            // errors, while still carrying the Cloudflare trust tokens.
-            System.out.println("Attempting to use the real Chrome user profile...");
-            String seleniumProfilePath = buildSeleniumProfile();
-
+            // ── Launch with a fresh temp profile each run ────────────────────
+            // DataDome fingerprints the browser profile itself across sessions.
+            // Using a copied or persistent profile means DataDome recognises the
+            // session as automation and rejects the slider solve before you even
+            // touch it. A fresh profile every run looks like a brand-new browser
+            // to DataDome's fingerprinting — the Cloudflare captcha (first page)
+            // is the only challenge you'll need to solve manually.
+            System.out.println("Launching Chrome with a fresh profile...");
             ChromeDriver launched = null;
-
-            if (seleniumProfilePath != null) {
-                try {
-                    ChromeOptions opts = buildBaseOptions();
-                    opts.addArguments("--user-data-dir=" + seleniumProfilePath);
-                    opts.addArguments("--profile-directory=Default");
-                    launched = new ChromeDriver(opts);
-                    System.out.println("  Launched with Selenium profile (cookies imported).");
-                } catch (Exception e) {
-                    String reason = e.getMessage() == null ? "unknown"
-                            : e.getMessage().lines().filter(l -> !l.isBlank()).findFirst().orElse("unknown");
-                    System.out.println("  Selenium profile launch failed: " + reason);
-                    launched = null;
-                }
-            }
-
-            // ── Strategy 2: Clean temp profile fallback ───────────────────────
-            if (launched == null) {
-                System.out.println("Falling back to a temporary profile (Cloudflare may prompt captcha).");
-                try {
-                    launched = new ChromeDriver(buildBaseOptions());
-                } catch (Exception e2) {
-                    throw new RuntimeException("Could not launch Chrome: " + e2.getMessage(), e2);
-                }
+            try {
+                launched = new ChromeDriver(buildBaseOptions());
+                System.out.println("  Launched with fresh profile.");
+            } catch (Exception e) {
+                throw new RuntimeException("Could not launch Chrome: " + e.getMessage(), e);
             }
 
             driver = launched;
 
             // ── Inject stealth script via CDP ─────────────────────────────────
+            // We use the raw CDP command map (devTools.send with a plain Map) rather
+            // than the typed Page.addScriptToEvaluateOnNewDocument() API. This avoids
+            // ALL Selenium/Chrome version mismatch issues — the raw command works on
+            // every Chrome version because it speaks the CDP wire protocol directly.
+            // executeCdpCommand() is ChromeDriver's stable, version-agnostic way to
+            // send raw CDP commands. Unlike the typed Page.addScriptToEvaluateOnNewDocument()
+            // API, it doesn't import any versioned devtools class, so it works regardless
+            // of whether Selenium's bundled CDP version matches the installed Chrome version.
             try {
-                DevTools devTools = driver.getDevTools();
-                devTools.createSession();
-                devTools.send(Page.addScriptToEvaluateOnNewDocument(STEALTH_SCRIPT, null, null, null));
+                java.util.Map<String, Object> params = new java.util.HashMap<>();
+                params.put("source", STEALTH_SCRIPT);
+                driver.executeCdpCommand("Page.addScriptToEvaluateOnNewDocument", params);
                 System.out.println("CDP stealth script injected successfully.");
-
-                // ── Inject Proxy-Authorization header via CDP ──────────────────
-                // Chrome sometimes ignores credentials embedded in --proxy-server URL.
-                // Setting the header directly via CDP Network.setExtraHTTPHeaders
-                // ensures every request carries the proxy auth token.
-                if (PROXY_ENABLED) {
-                    try {
-                        String credentials = PROXY_USERNAME + ":" + PROXY_PASSWORD;
-                        String encoded = java.util.Base64.getEncoder()
-                                .encodeToString(credentials.getBytes(java.nio.charset.StandardCharsets.UTF_8));
-                        devTools.send(org.openqa.selenium.devtools.v144.network.Network.enable(
-                                java.util.Optional.empty(), java.util.Optional.empty(), java.util.Optional.empty(), java.util.Optional.empty(), java.util.Optional.empty()));
-                        devTools.send(org.openqa.selenium.devtools.v144.network.Network.setExtraHTTPHeaders(
-                                new org.openqa.selenium.devtools.v144.network.model.Headers(
-                                        java.util.Map.of("Proxy-Authorization", "Basic " + encoded))));
-                        System.out.println("  Proxy-Authorization header injected via CDP.");
-                    } catch (Exception proxyEx) {
-                        System.out.println("  CDP proxy auth header skipped: " + proxyEx.getMessage());
-                    }
-                }
-            } catch (Exception e) {
-                System.out.println("CDP stealth injection skipped (" + e.getMessage() + "); using JS fallback.");
+            } catch (Exception cdpEx) {
+                // CDP unavailable — fall back to post-load JS injection.
+                // This runs after page JS (less ideal) but still masks navigator.webdriver.
+                System.out.println("CDP unavailable (" + cdpEx.getMessage()
+                        + "); using JS fallback.");
                 try {
                     ((JavascriptExecutor) driver).executeScript(
                             "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})");
@@ -444,8 +456,6 @@ public class TruePeopleSearchScraper {
         taskkill("/F", "/IM", "chrome.exe", "/T");
         taskkill("/F", "/IM", "chrome_crashpad_handler.exe", "/T");
         try { Thread.sleep(2000); } catch (Exception ignored) {}
-        // Refresh the Selenium profile with fresh cookies before next launch
-        buildSeleniumProfile();
         System.out.println("Browser restart complete. New session will start on next search.");
     }
 
@@ -458,14 +468,14 @@ public class TruePeopleSearchScraper {
      * @param city  city name
      * @param state two-letter state abbreviation
      */
-    public static PersonContact search(String name, String city, String state) throws Exception {
+    public static PersonContact search(String name, String city, String state) throws Exception, IpBanException {
         return search(getDriver(), name, city, state);
     }
 
     // ── Core scraping logic ───────────────────────────────────────────────────
 
     static PersonContact search(WebDriver webDriver, String name, String city, String state)
-            throws Exception {
+            throws Exception, IpBanException {
 
         PersonContact result = new PersonContact();
 
@@ -541,7 +551,9 @@ public class TruePeopleSearchScraper {
             if (!c.endsWith(".png") && !c.endsWith(".jpg") && !c.endsWith(".svg")
                     && !c.endsWith(".gif") && !c.contains("sentry.io")
                     && !c.contains("example.com") && !c.contains("w3.org")
-                    && !c.contains("schema.org")) {
+                    && !c.contains("schema.org")
+                    && !c.equalsIgnoreCase("jsmith@gmail.com")
+                    && !c.equalsIgnoreCase("support@truepeoplesearch.com")) {
                 emails.add(c);
             }
         }
@@ -563,95 +575,129 @@ public class TruePeopleSearchScraper {
      * If a captcha or restriction clears, re-navigates to detailUrl and waits again.
      * Returns true if the page loaded successfully, false if it timed out.
      */
-    private static boolean waitForDetailPage(WebDriver webDriver, String detailUrl) {
-        // Brief render pause (PageLoadStrategy.NONE returns before DOM is ready)
-        try { Thread.sleep(1500); } catch (Exception ignored) {}
+    /**
+     * Handles a captcha that appeared on a detail page.
+     *
+     * After the user solves the captcha, TPS may either:
+     *   A) Return directly to the detail page with content — success
+     *   B) Show "Access is temporarily restricted" — trigger ban wait then retry
+     *   C) Stay on a captcha page — user didn't solve it in time
+     *
+     * Always checks post-solve state before deciding whether to re-navigate.
+     */
+    private static boolean handleDetailCaptcha(WebDriver webDriver, String detailUrl)
+            throws IpBanException {
+        boolean solved = waitForManualCaptcha(webDriver);
+        if (!solved) return false;
 
-        // Check for immediate block states before polling
-        String currentUrl = webDriver.getCurrentUrl();
-        if (currentUrl != null && currentUrl.toLowerCase().contains("internalcaptcha")) {
-            boolean solved = waitForManualCaptcha(webDriver);
-            if (solved) {
-                // Re-navigate to the detail page after captcha
-                webDriver.get(detailUrl);
-                try { Thread.sleep(2000); } catch (Exception ignored) {}
-            }
-            return solved;
-        }
-        String immediateHtml = pageHtml(webDriver);
-        if (isAccessRestricted(immediateHtml)) {
+        // After captcha solve, check what TPS actually showed us
+        try { Thread.sleep(2000); } catch (Exception ignored) {}
+        String postSrc = pageHtml(webDriver);
+
+        // If TPS responded with a restriction page, wait for it to clear
+        if (isBlockedUrl(webDriver) || isAccessRestricted(postSrc)) {
+            System.out.println("  Access restricted immediately after captcha solve.");
             return waitForAccessRestriction(webDriver, detailUrl);
         }
 
-        // Main poll loop — wait up to 45 s for content to appear
+        // If we're already on the detail page with content, no need to re-navigate
+        if (postSrc != null && (postSrc.contains("card-summary")
+                || postSrc.contains("card-block")
+                || postSrc.contains("data-link"))) {
+            System.out.println("  Detail page loaded after captcha.");
+            return true;
+        }
+
+        // Otherwise navigate back to the detail page
+        webDriver.get(detailUrl);
+        try { Thread.sleep(3000); } catch (Exception ignored) {}
+
+        // Final check after re-navigation
+        String finalSrc = pageHtml(webDriver);
+        if (isBlockedUrl(webDriver) || isAccessRestricted(finalSrc)) {
+            System.out.println("  Access restricted after re-navigation.");
+            return waitForAccessRestriction(webDriver, detailUrl);
+        }
+        return true;
+    }
+
+    private static boolean waitForDetailPage(WebDriver webDriver, String detailUrl) throws IpBanException {
+        // Render pause — PageLoadStrategy.NONE returns immediately after navigation starts,
+        // so we wait 5 seconds for the initial HTML to appear before checking page state.
+        // The extra time ensures slider captchas (which load slightly after the page skeleton)
+        // are fully rendered before the first isCaptchaPage() check runs.
+        try { Thread.sleep(5000); } catch (Exception ignored) {}
+
+        // Check for immediate block states before polling
+        String currentUrl = webDriver.getCurrentUrl();
+        String immediateHtml = pageHtml(webDriver);
+
+        // Check captcha first — slider captcha page also contains restriction text
+        if (isCaptchaPage(immediateHtml, currentUrl)) {
+            return handleDetailCaptcha(webDriver, detailUrl);
+        }
+        if (isBlockedUrl(webDriver) || isAccessRestricted(immediateHtml)) {
+            return waitForAccessRestriction(webDriver, detailUrl);
+        }
+
+        // Main poll loop — wait up to 60 s for content to appear.
         try {
-            WebDriverWait wait = new WebDriverWait(webDriver, Duration.ofSeconds(45));
+            WebDriverWait wait = new WebDriverWait(webDriver, Duration.ofSeconds(60));
             wait.until((ExpectedCondition<Boolean>) d -> {
                 String url = d.getCurrentUrl();
                 String src = pageHtml(d);
                 if (src == null) return false;
-                // Break out immediately if we hit any blocking state
+                if (isBlockedUrl(d)) return true;
                 if (isCaptchaPage(src, url)) return true;
                 if (isAccessRestricted(src)) return true;
-                boolean hasContent = src.contains("card-summary")
-                        || src.contains("card-block")
+                return src.contains("card-summary") || src.contains("card-block")
                         || src.contains("data-link");
-                return hasContent;
             });
         } catch (Exception ignored) {}
 
-        // Render buffer — give DOM time to finish updating
+        // Render buffer
         try { Thread.sleep(2000); } catch (Exception ignored) {}
 
         String currentUrl2 = webDriver.getCurrentUrl();
         String src = pageHtml(webDriver);
 
-        // Handle access restriction
-        if (isAccessRestricted(src)) {
-            System.out.println("  Access restricted on detail page.");
-            return waitForAccessRestriction(webDriver, detailUrl);
+        // ── Diagnostic: dump full page HTML to a temp file so we can see exactly
+        // what TPS returned (helps identify unknown captcha/block page strings)
+        if (src != null && !src.contains("card-summary") && !src.contains("card-block")
+                && !src.contains("data-link")) {
+            try {
+                String dumpPath = System.getenv("TEMP") + "\\tps_detail_page.html";
+                java.nio.file.Files.writeString(java.nio.file.Paths.get(dumpPath), src);
+                System.out.println("  Detail page HTML dumped to: " + dumpPath);
+                // Also print visible text preview
+                String preview = src.replaceAll("<[^>]+>", " ").replaceAll("\\s+", " ").trim();
+                preview = preview.length() > 500 ? preview.substring(0, 500) : preview;
+                System.out.println("  Page text: " + preview);
+            } catch (Exception ignored2) {}
         }
 
-        // Handle any captcha type (redirect OR inline Cloudflare OR TPS internal)
+        // Check captcha FIRST — the slider captcha page also contains restriction
+        // text lower on the page, so if we check restriction first we miss the captcha.
         if (isCaptchaPage(src, currentUrl2)) {
-            System.out.println();
-            System.out.println("  *** CAPTCHA REQUIRED ***");
-            System.out.println("  TruePeopleSearch has shown a captcha in the browser window.");
-            System.out.println("  Please solve it manually. The program will resume automatically.");
-            System.out.println("  Waiting up to 3 minutes...");
-            System.out.println();
-            try {
-                WebDriverWait captchaWait = new WebDriverWait(webDriver, Duration.ofMinutes(3));
-                captchaWait.until((ExpectedCondition<Boolean>) d -> {
-                    String u = d.getCurrentUrl();
-                    String s = pageHtml(d);
-                    if (s == null) return false;
-                    // Break out on access restriction so we can handle it
-                    if (isAccessRestricted(s)) return true;
-                    // Still on captcha — keep waiting
-                    if (isCaptchaPage(s, u)) return false;
-                    // Captcha is gone — success regardless of whether cards have loaded yet
-                    return true;
-                });
-                // Brief pause to let the post-captcha page finish rendering
-                try { Thread.sleep(2000); } catch (Exception ignored) {}
-                String postSrc = pageHtml(webDriver);
-                if (isAccessRestricted(postSrc)) {
-                    System.out.println("  Access restricted after captcha.");
-                    return waitForAccessRestriction(webDriver, detailUrl);
-                }
-                System.out.println("  Captcha solved — resuming.");
-                return true;
-            } catch (Exception ex) {
-                System.out.println("  Captcha not solved within 3 minutes; scraping whatever is present.");
-                return false;
-            }
+            return handleDetailCaptcha(webDriver, detailUrl);
+        }
+
+        // Handle access restriction only if no captcha was detected
+        if (isBlockedUrl(webDriver) || isAccessRestricted(src)) {
+            System.out.println("  Access restricted on detail page.");
+            return waitForAccessRestriction(webDriver, detailUrl);
         }
 
         boolean hasContent = src != null
                 && (src.contains("card-summary") || src.contains("card-block") || src.contains("data-link"));
         if (!hasContent) {
             System.out.println("  Detail page timed out; scraping whatever is present.");
+            // Print a text preview so we can see exactly what TPS returned
+            if (src != null) {
+                String preview = src.replaceAll("<[^>]+>", " ").replaceAll("\\s+", " ").trim();
+                preview = preview.length() > 400 ? preview.substring(0, 400) : preview;
+                System.out.println("  Detail page content preview: " + preview);
+            }
         }
         return hasContent;
     }
@@ -697,6 +743,9 @@ public class TruePeopleSearchScraper {
     /** Returns true if the page HTML or URL indicates TPS has blocked access. */
     private static boolean isAccessRestricted(String src) {
         if (src == null) return false;
+        // Never treat a DataDome captcha page as an access restriction —
+        // it needs to be solved, not waited out.
+        if (src.contains("captcha-delivery.com") || src.contains("var dd={")) return false;
         return src.contains("Access is temporarily restricted")
                 || src.contains("temporarily restricted")
                 || src.contains("Automated (bot) activity")
@@ -731,10 +780,18 @@ public class TruePeopleSearchScraper {
         return src.contains("cf-turnstile-response")
                 || src.toLowerCase().contains("internalcaptcha")
                 || src.contains("captchasubmit")
-                || src.contains("rrstamp");   // TPS rate-limit stamp present in captcha pages
+                || src.contains("rrstamp")                  // TPS rate-limit stamp
+                || src.contains("Verification Required")    // slider captcha title (rendered)
+                || src.contains("Slide right to secure")    // slider captcha instruction
+                || src.contains("slide-captcha")            // slider captcha CSS class
+                || src.contains("slider-captcha")           // alternate slider class
+                || src.contains("captcha-delivery.com")     // DataDome captcha CDN (raw JS)
+                || src.contains("geo.captcha-delivery")     // DataDome geo endpoint
+                || src.contains("var dd={")                 // DataDome challenge variable
+                || src.contains("'rt':'c'");                // DataDome challenge type flag
     }
 
-    private static boolean waitForResultsPage(WebDriver webDriver, String targetUrl) {
+    private static boolean waitForResultsPage(WebDriver webDriver, String targetUrl) throws IpBanException {
         // Brief pause for initial page render (PageLoadStrategy.NONE returns before DOM is ready)
         try { Thread.sleep(1500); } catch (Exception ignored) {}
 
@@ -742,14 +799,12 @@ public class TruePeopleSearchScraper {
         String currentUrl = webDriver.getCurrentUrl();
         String immediateHtml = pageHtml(webDriver);
         // Check URL first — /ratelimited is a hard block distinct from captcha
-        if (isBlockedUrl(webDriver) || isAccessRestricted(immediateHtml)) {
-            if (isCaptchaPage(immediateHtml, currentUrl)) {
-                return waitForManualCaptcha(webDriver);
-            }
-            return waitForAccessRestriction(webDriver, targetUrl);
-        }
+        // Check captcha first — slider captcha page also contains restriction text
         if (isCaptchaPage(immediateHtml, currentUrl)) {
             return waitForManualCaptcha(webDriver);
+        }
+        if (isBlockedUrl(webDriver) || isAccessRestricted(immediateHtml)) {
+            return waitForAccessRestriction(webDriver, targetUrl);
         }
 
         try {
@@ -809,7 +864,7 @@ public class TruePeopleSearchScraper {
      * The targetUrl parameter is the page we were trying to load when blocked.
      * Pass null to skip re-navigation (e.g. when called from detail page handler).
      */
-    private static boolean waitForAccessRestriction(WebDriver webDriver, String targetUrl) {
+    private static boolean waitForAccessRestriction(WebDriver webDriver, String targetUrl) throws IpBanException {
         System.out.println();
         System.out.println("  *** ACCESS TEMPORARILY RESTRICTED / RATE LIMITED ***");
         System.out.println("  TruePeopleSearch has blocked this session (IP rate-limited or flagged).");
@@ -838,8 +893,8 @@ public class TruePeopleSearchScraper {
         }
 
         if (!blockCleared) {
-            System.out.println("  Block did not clear within 15 minutes. Skipping this row.");
-            return false;
+            System.out.println("  Block did not clear within 15 minutes.");
+            throw new IpBanException("TruePeopleSearch IP ban did not lift within 15 minutes.");
         }
 
         // Phase 2: Re-navigate to the target URL (the page we were originally trying to load).
@@ -889,6 +944,8 @@ public class TruePeopleSearchScraper {
         System.out.println("  *** CAPTCHA REQUIRED ***");
         System.out.println("  TruePeopleSearch has shown a captcha in the browser window.");
         System.out.println("  Please solve it manually. The program will resume automatically.");
+        System.out.println("  TIP: If it is a slider captcha, drag it SLOWLY with smooth,");
+        System.out.println("       slightly uneven movement — not a quick straight drag.");
         System.out.println("  Waiting up to 3 minutes...");
         System.out.println();
 
@@ -908,9 +965,9 @@ public class TruePeopleSearchScraper {
             // Brief pause to let the post-captcha page finish rendering
             try { Thread.sleep(2000); } catch (Exception ignored) {}
             String postSrc = pageHtml(webDriver);
-            if (isAccessRestricted(postSrc)) {
+            if (isBlockedUrl(webDriver) || isAccessRestricted(postSrc)) {
                 System.out.println("  Access restricted after captcha.");
-                // No target URL available here — caller will handle re-navigation
+                // No target URL here — caller (waitForResultsPage) will handle re-navigation
                 return waitForAccessRestriction(webDriver, null);
             }
             // Extra pause after captcha solve — TPS is already suspicious of this session.

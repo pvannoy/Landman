@@ -14,6 +14,16 @@ import java.nio.file.Paths;
  * any position). Each row is searched on TruePeopleSearch and the results
  * (phones_tps, emails_tps) are written to found_data.xlsx in the same directory
  * as the input file.
+ *
+ * Resume behaviour:
+ *   If found_data.xlsx already exists from a previous run, rows that already have
+ *   a Phone or Email value are skipped automatically. This means you can re-run
+ *   the program after an IP ban and it will pick up exactly where it left off.
+ *
+ * IP ban behaviour:
+ *   If TruePeopleSearch bans the IP and the ban does not lift within 15 minutes,
+ *   the program saves all progress collected so far and exits cleanly. Re-run
+ *   once the ban has lifted to collect the remaining rows.
  */
 public class Main {
 
@@ -39,8 +49,47 @@ public class Main {
         }
 
         File selectedFile = fileChooser.getSelectedFile();
-        String inputPath = selectedFile.getAbsolutePath();
-        String outputPath = Paths.get(selectedFile.getParent(), "found_data.xlsx").toString();
+        String selectedPath = selectedFile.getAbsolutePath();
+        String selectedName = selectedFile.getName();
+
+        // ── Derive the input and output paths from whichever file was selected ─
+        //
+        // The user may select either:
+        //   A) The original input file  (e.g. "Grady - 32-8N-8W - Test.xlsx")
+        //   B) A previous output file   (e.g. "Grady - 32-8N-8W - Test_found_data.xlsx")
+        //
+        // If (B) is selected we work directly with that file — inputPath and
+        // outputPath both point to it, and existing results are preserved.
+        // If (A) is selected and a _found_data file already exists beside it,
+        // we resume from that file automatically.
+        // If (A) is selected and no _found_data file exists, we start fresh.
+
+        int dotIndex = selectedName.lastIndexOf('.');
+        String baseName  = dotIndex > 0 ? selectedName.substring(0, dotIndex) : selectedName;
+        String extension = dotIndex > 0 ? selectedName.substring(dotIndex)    : ".xlsx";
+
+        String inputPath;
+        String outputPath;
+
+        if (baseName.endsWith("_found_data")) {
+            // User selected the _found_data file directly — use it as both source and output
+            inputPath  = selectedPath;
+            outputPath = selectedPath;
+            System.out.println("Resuming from selected output file: " + selectedPath);
+        } else {
+            // User selected the original input file
+            inputPath  = selectedPath;
+            outputPath = Paths.get(selectedFile.getParent(),
+                    baseName + "_found_data" + extension).toString();
+
+            if (new java.io.File(outputPath).exists()) {
+                // A _found_data file already exists — resume from it
+                inputPath = outputPath;
+                System.out.println("Found existing output file — resuming from: " + outputPath);
+            } else {
+                System.out.println("No existing output file found — starting fresh.");
+            }
+        }
 
         int delay = DEFAULT_DELAY;
         if (args.length >= 1) {
@@ -49,10 +98,9 @@ public class Main {
             } catch (NumberFormatException ignored) {}
         }
 
-        System.out.println("Selected file: " + inputPath);
+        System.out.println("Selected file: " + selectedPath);
         System.out.println("Output will be written to: " + outputPath);
 
-        // ── Process the Excel file ───────────────────────────────────────────
         try (FileInputStream fis = new FileInputStream(inputPath);
              Workbook workbook = new XSSFWorkbook(fis)) {
 
@@ -133,16 +181,32 @@ public class Main {
                     continue;
                 }
 
+                // ── Skip rows already completed in a previous run ─────────────
+                // A row is considered done if it already has a non-empty Phone
+                // or Email value. This enables resume-after-ban behaviour.
+                String existingPhone = getCellString(row.getCell(phonesTpsCol));
+                String existingEmail = getCellString(row.getCell(emailsTpsCol));
+                if (!existingPhone.isEmpty() || !existingEmail.isEmpty()) {
+                    System.out.println("Skipping row " + r + " (already completed): " + name);
+                    continue;
+                }
+
                 System.out.println("Searching for: " + name + ", " + city + ", " + state);
                 System.out.println("Searching in TruePeopleSearch...");
 
                 // Retry loop — if the browser crashes mid-search, restart it and try once more.
                 TruePeopleSearchScraper.PersonContact contact = null;
                 int attempts = 0;
+                boolean ipBanned = false;
                 while (contact == null && attempts < 2) {
                     attempts++;
                     try {
                         contact = TruePeopleSearchScraper.search(name, city, state);
+                    } catch (TruePeopleSearchScraper.IpBanException banEx) {
+                        // IP ban did not lift — save progress and exit cleanly
+                        System.out.println("IP ban could not be resolved. Saving progress and exiting.");
+                        ipBanned = true;
+                        break;
                     } catch (org.openqa.selenium.WebDriverException browserEx) {
                         System.out.println("Browser died (attempt " + attempts + "): " + browserEx.getMessage().split("\n")[0]);
                         if (attempts < 2) {
@@ -154,6 +218,21 @@ public class Main {
                             contact = new TruePeopleSearchScraper.PersonContact();
                         }
                     }
+                }
+
+                // If banned, save what we have and exit so the user can resume later
+                if (ipBanned) {
+                    try (FileOutputStream fos = new FileOutputStream(outputPath)) {
+                        workbook.write(fos);
+                    }
+                    TruePeopleSearchScraper.quit();
+                    System.out.println("Progress saved to: " + outputPath);
+                    System.out.println("Re-run the program after the IP ban lifts to collect remaining rows.");
+                    JOptionPane.showMessageDialog(null,
+                            "IP ban could not be resolved.\n\nProgress saved to:\n" + outputPath
+                            + "\n\nRe-run after the ban lifts to collect remaining rows.",
+                            "Stopped — IP Banned", JOptionPane.WARNING_MESSAGE);
+                    return;
                 }
 
                 String phonesStr = String.join("\n", contact.phones);
