@@ -14,7 +14,7 @@ import time
 import re
 import os
 
-SCRAPER_VERSION = "2.5"  # Updated: check success before restriction
+SCRAPER_VERSION = "2.7"  # Updated: check success before restriction
 print(f"[scraper] version {SCRAPER_VERSION}", file=__import__("sys").stderr, flush=True)
 
 # Suppress noisy logs from selenium/urllib3
@@ -80,6 +80,9 @@ def is_captcha(src, url):
         "cf-turnstile-response", "internalcaptcha", "captchasubmit",
         "rrstamp", "Verification Required", "Slide right to secure",
         "captcha-delivery.com", "geo.captcha-delivery", "var dd={", "'rt':'c'",
+        "Incorrect device time",          # Cloudflare clock-mismatch challenge
+        "Automatic submission failed",    # Cloudflare failed auto-solve page
+        "device time",                    # broader match for same variant
     ])
 
 def is_restricted(src):
@@ -126,7 +129,14 @@ def wait_for_results(driver, url, timeout=60):
         # 1. Success
         if "data-detail-link" in src:
             return True
-        if "No results found" in src:
+        # All TPS "no results" messages — skip and move on
+        if any(s in src for s in [
+            "No results found",
+            "We could not find any records",
+            "Last name alone is not enough",
+            "could not find any records for that search",
+            "no records for that search",
+        ]):
             return False
 
         # 2. Captcha (check BEFORE restriction — InternalCaptcha URL also matches

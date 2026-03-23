@@ -177,7 +177,9 @@ public class TruePeopleSearchScraper {
                         System.out.println("  *** CAPTCHA REQUIRED ***");
                         System.out.println("  TruePeopleSearch has shown a captcha in the browser window.");
                         System.out.println("  Please solve it manually. The program will resume automatically.");
-                        System.out.println("  TIP: For the slider captcha, drag SLOWLY with a slight wobble.");
+                        System.out.println("  TIP: Slider captcha — drag SLOWLY with a slight wobble.");
+                    System.out.println("       'Incorrect device time' captcha — click Submit. Also check your system clock is correct.");
+                    System.out.println("       Cloudflare checkbox — click the checkbox.");
                         System.out.println("  Waiting up to 3 minutes...");
                         System.out.println();
                     }

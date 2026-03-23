@@ -30,6 +30,7 @@ public class Main {
     private static final int DEFAULT_DELAY = 45;
 
     public static void main(String[] args) {
+        long startTime = System.currentTimeMillis();
         // Ensure Swing dialogs use the native OS look-and-feel
         try {
             UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName());
@@ -263,7 +264,9 @@ public class Main {
                 workbook.write(fos);
             }
 
+            long elapsed = System.currentTimeMillis() - startTime;
             System.out.println("Results written to: " + outputPath);
+            System.out.println("Total run time: " + formatElapsed(elapsed));
 
             // Close the shared browser now that all rows have been processed
             TruePeopleSearchScraper.quit();
@@ -305,5 +308,19 @@ public class Main {
         Cell cell = row.getCell(col);
         if (cell == null) cell = row.createCell(col);
         return cell;
+    }
+
+    /** Format elapsed milliseconds as a human-readable duration. */
+    private static String formatElapsed(long millis) {
+        long totalSeconds = millis / 1000;
+        long hours   = totalSeconds / 3600;
+        long minutes = (totalSeconds % 3600) / 60;
+        long seconds = totalSeconds % 60;
+        if (hours > 0)
+            return String.format("%d hr %d min %d sec", hours, minutes, seconds);
+        else if (minutes > 0)
+            return String.format("%d min %d sec", minutes, seconds);
+        else
+            return String.format("%d sec", seconds);
     }
 }
