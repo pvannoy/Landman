@@ -109,7 +109,7 @@ public class Main {
 
             // ── Locate the header row by scanning for known column names ─────
             Row headerRow = null;
-            int nameCol = -1, cityCol = -1, stCol = -1;
+            int nameCol = -1, cityCol = -1, stCol = -1, cityStZipCol = -1, fullAddressCol = -1;
             int phonesTpsCol = -1, emailsTpsCol = -1;
 
             for (int r = 0; r <= sheet.getLastRowNum(); r++) {
@@ -127,11 +127,18 @@ public class Main {
                         case "st","state" -> stCol = c;
                         case "phone" -> phonesTpsCol = c;
                         case "email" -> emailsTpsCol = c;
+                        case "address" -> fullAddressCol = c;
+                        // Combined "CITY, ST ZIP" or "CITY, STATE ZIP" column
+                        default -> {
+                            if (header.startsWith("city") && (header.contains("st") || header.contains("zip"))) {
+                                cityStZipCol = c;
+                            }
+                        }
                     }
                 }
 
                 // Found the header row once we see the three required columns
-                if (nameCol != -1 && cityCol != -1 && stCol != -1) {
+                if (nameCol != -1 && ((cityCol != -1 && stCol != -1) || cityStZipCol != -1 || fullAddressCol != -1)) {
                     headerRow = candidate;
                     break;
                 }
@@ -140,13 +147,15 @@ public class Main {
                 nameCol = -1;
                 cityCol = -1;
                 stCol = -1;
+                cityStZipCol = -1;
+                fullAddressCol = -1;
                 phonesTpsCol = -1;
                 emailsTpsCol = -1;
             }
 
             if (headerRow == null) {
                 JOptionPane.showMessageDialog(null,
-                        "Could not find a header row with columns: Name, City, St",
+                        "Could not find a header row with columns:\nName + City + St\nName + CITY,ST ZIP\nName + Address (full)",
                         "Missing Columns", JOptionPane.ERROR_MESSAGE);
                 System.exit(2);
             }
@@ -174,8 +183,21 @@ public class Main {
                 if (row == null) continue;
 
                 String name = getCellString(row.getCell(nameCol));
-                String city = getCellString(row.getCell(cityCol));
-                String state = getCellString(row.getCell(stCol));
+                String city, state;
+                if (fullAddressCol != -1) {
+                    // Parse city/state from full address "123 Main St, Oklahoma City, OK 73107"
+                    String[] parsed = parseFullAddress(getCellString(row.getCell(fullAddressCol)));
+                    city  = parsed[0];
+                    state = parsed[1];
+                } else if (cityStZipCol != -1) {
+                    // Parse "City, ST ZIP" or "City, ST" from combined column
+                    String[] parsed = parseCityStateZip(getCellString(row.getCell(cityStZipCol)));
+                    city  = parsed[0];
+                    state = parsed[1];
+                } else {
+                    city  = getCellString(row.getCell(cityCol));
+                    state = getCellString(row.getCell(stCol));
+                }
 
                 if (name.isEmpty() || city.isEmpty() || state.isEmpty()) {
                     System.out.println("Skipping row " + r + " (missing data)");
@@ -308,6 +330,49 @@ public class Main {
         Cell cell = row.getCell(col);
         if (cell == null) cell = row.createCell(col);
         return cell;
+    }
+
+    /**
+     * Parse city and state from a full address like:
+     *   "8101 NW 110th St, Oklahoma City, OK 73107" → ["Oklahoma City", "OK"]
+     *   "123 Main St, Edmond, OK"                   → ["Edmond", "OK"]
+     *
+     * Strategy: split on commas, take the last two segments.
+     * The second-to-last segment is the city; the last segment starts with the state code.
+     * If fewer than 3 comma-separated parts, fall back to parseCityStateZip.
+     */
+    private static String[] parseFullAddress(String raw) {
+        if (raw == null || raw.isBlank()) return new String[]{"", ""};
+        String[] parts = raw.split(",");
+        if (parts.length >= 3) {
+            // e.g. ["8101 NW 110th St", " Oklahoma City", " OK 73107"]
+            String city  = parts[parts.length - 2].trim();
+            String stZip = parts[parts.length - 1].trim();
+            String state = stZip.split("\\s+")[0].trim();
+            return new String[]{city, state};
+        }
+        // Fewer than 3 parts — treat as "City, ST ZIP" format
+        return parseCityStateZip(raw);
+    }
+
+    /**
+     * Parse a combined "City, ST ZIP" or "City, ST" cell into [city, state].
+     * Examples:
+     *   "Evergreen, CO 80439"  → ["Evergreen", "CO"]
+     *   "Oklahoma City, OK"    → ["Oklahoma City", "OK"]
+     *   "Custer City, OK 73639" → ["Custer City", "OK"]
+     */
+    private static String[] parseCityStateZip(String raw) {
+        if (raw == null || raw.isBlank()) return new String[]{"", ""};
+        // Split on the last comma — everything before is the city,
+        // everything after is "ST" or "ST ZIP"
+        int lastComma = raw.lastIndexOf(',');
+        if (lastComma < 0) return new String[]{raw.trim(), ""};
+        String city  = raw.substring(0, lastComma).trim();
+        String stZip = raw.substring(lastComma + 1).trim();
+        // State is the first token after the comma; ZIP (if present) follows
+        String state = stZip.split("\\s+")[0].trim();
+        return new String[]{city, state};
     }
 
     /** Format elapsed milliseconds as a human-readable duration. */

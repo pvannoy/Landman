@@ -32,11 +32,70 @@ public class TruePeopleSearchScraper {
     private static final String SCRAPER_PY_PATH = resolvePyPath();
 
     /**
-     * Full path to the Python executable. Uses the path discovered during
-     * pip install. Adjust if Python is installed elsewhere on your machine.
+     * Full path to the Python executable, resolved at startup by searching
+     * common install locations and the system PATH. Works on any machine
+     * without hardcoding a user-specific path.
      */
-    private static final String PYTHON_EXE =
-            "C:\\Users\\Phil\\AppData\\Local\\Python\\pythoncore-3.14-64\\python.exe";
+    private static final String PYTHON_EXE = resolvePythonExe();
+
+    /**
+     * Auto-detect the Python executable by:
+     * 1. Trying "python" and "python3" on the system PATH (works if Python
+     *    was installed with "Add to PATH" checked, or on macOS/Linux)
+     * 2. Searching common Windows install directories as a fallback
+     */
+    private static String resolvePythonExe() {
+        // Step 1 — try PATH candidates first (fastest, most portable)
+        for (String candidate : new String[]{"python", "python3", "py"}) {
+            try {
+                Process p = new ProcessBuilder(candidate, "--version")
+                        .redirectErrorStream(true)
+                        .start();
+                p.waitFor(5, java.util.concurrent.TimeUnit.SECONDS);
+                if (p.exitValue() == 0) {
+                    return candidate;  // found on PATH — use simple name
+                }
+            } catch (Exception ignored) {}
+        }
+
+        // Step 2 — search common Windows install locations
+        String localApp = System.getenv("LOCALAPPDATA");
+        String userProfile = System.getenv("USERPROFILE");
+        List<String> searchDirs = new ArrayList<>();
+        if (localApp != null) {
+            searchDirs.add(localApp + "\\Programs\\Python");
+            searchDirs.add(localApp + "\\Python");
+        }
+        if (userProfile != null) {
+            searchDirs.add(userProfile + "\\AppData\\Local\\Programs\\Python");
+            searchDirs.add(userProfile + "\\AppData\\Local\\Python");
+        }
+        searchDirs.add("C:\\Python313");
+        searchDirs.add("C:\\Python312");
+        searchDirs.add("C:\\Python311");
+        searchDirs.add("C:\\Python310");
+        searchDirs.add("C:\\Program Files\\Python313");
+        searchDirs.add("C:\\Program Files\\Python312");
+
+        for (String dir : searchDirs) {
+            File base = new File(dir);
+            if (!base.exists()) continue;
+            // May be directly a python.exe or contain versioned subdirectories
+            File direct = new File(base, "python.exe");
+            if (direct.exists()) return direct.getAbsolutePath();
+            // Scan one level of subdirectories (e.g. Python313, pythoncore-3.14-64)
+            File[] subs = base.listFiles(File::isDirectory);
+            if (subs != null) {
+                for (File sub : subs) {
+                    File exe = new File(sub, "python.exe");
+                    if (exe.exists()) return exe.getAbsolutePath();
+                }
+            }
+        }
+
+        // Step 3 — last resort: return "python" and let the OS error explain it
+        return "python";
+    }
 
     // ── Inner types ───────────────────────────────────────────────────────────
 
@@ -71,7 +130,7 @@ public class TruePeopleSearchScraper {
         if (pyProcess != null && pyProcess.isAlive()) return;
 
         System.out.println("Starting Python scraper subprocess...");
-        System.out.println("  Python : " + PYTHON_EXE);
+        System.out.println("  Python : " + PYTHON_EXE + (PYTHON_EXE.equals("python") || PYTHON_EXE.equals("python3") || PYTHON_EXE.equals("py") ? " (from PATH)" : ""));
         System.out.println("  Script : " + SCRAPER_PY_PATH);
 
         if (!new File(PYTHON_EXE).exists()) {
