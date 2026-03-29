@@ -343,18 +343,83 @@ public class Main {
      */
     private static String[] parseFullAddress(String raw) {
         if (raw == null || raw.isBlank()) return new String[]{"", ""};
+        // Normalize whitespace and newlines
+        raw = raw.replaceAll("[\r\n]+", " ").replaceAll("\\s{2,}", " ").trim();
+        // Strip trailing commas and country suffixes
+        raw = raw.replaceAll(",\\s*$", "").trim();
+        raw = raw.replaceAll("(?i),?\\s*(United States|USA|US)\\s*$", "").trim();
+        raw = raw.replaceAll(",\\s*$", "").trim();
+        // Normalize period-as-separator: "321 S Boston. Tulsa" → "321 S Boston, Tulsa"
+        raw = raw.replaceAll("\\.\\s+(?=[A-Z])", ", ");
+
         String[] parts = raw.split(",");
-        if (parts.length >= 3) {
-            // e.g. ["8101 NW 110th St", " Oklahoma City", " OK 73107"]
-            String city  = parts[parts.length - 2].trim();
-            String stZip = parts[parts.length - 1].trim();
-            String state = stZip.split("\\s+")[0].trim();
-            return new String[]{city, state};
+        for (int i = parts.length - 1; i >= 1; i--) {
+            String seg = parts[i].trim();
+            // Strip trailing ZIP to isolate state token: "OK 73102" → "OK"
+            String stToken = seg.replaceAll("\\s+\\d{5}(-\\d{4})?$", "").trim();
+            String state = resolveStateToken(stToken);
+            if (state != null) {
+                for (int j = i - 1; j >= 0; j--) {
+                    String part = parts[j].trim();
+                    if (part.matches("\\d{5}(-\\d{4})?")) continue; // skip bare ZIP
+                    String city = extractCityFromSegment(part);
+                    if (!city.isEmpty()) return new String[]{city, state};
+                }
+            }
         }
-        // Fewer than 3 parts — treat as "City, ST ZIP" format
-        return parseCityStateZip(raw);
+
+        // Fallback: "City ST 12345" with no comma before state code
+        java.util.regex.Matcher fb = java.util.regex.Pattern.compile(
+                ",\\s*([A-Za-z][A-Za-z ]+?)\\s+([A-Z]{2})\\s+\\d{5}").matcher(raw);
+        if (fb.find()) return new String[]{fb.group(1).trim(), fb.group(2).trim()};
+
+        return new String[]{"", ""};
     }
 
+    /** Resolve a token to a 2-letter US state code, or null if not recognized. */
+    private static String resolveStateToken(String token) {
+        token = token.trim();
+        if (token.matches("[A-Z]{2}")) return token;
+        if (token.matches("[A-Za-z]{2}")) return token.toUpperCase();
+        String[][] states = {
+            {"Alabama","AL"},{"Alaska","AK"},{"Arizona","AZ"},{"Arkansas","AR"},
+            {"California","CA"},{"Colorado","CO"},{"Connecticut","CT"},{"Delaware","DE"},
+            {"Florida","FL"},{"Georgia","GA"},{"Hawaii","HI"},{"Idaho","ID"},
+            {"Illinois","IL"},{"Indiana","IN"},{"Iowa","IA"},{"Kansas","KS"},
+            {"Kentucky","KY"},{"Louisiana","LA"},{"Maine","ME"},{"Maryland","MD"},
+            {"Massachusetts","MA"},{"Michigan","MI"},{"Minnesota","MN"},{"Mississippi","MS"},
+            {"Missouri","MO"},{"Montana","MT"},{"Nebraska","NE"},{"Nevada","NV"},
+            {"New Hampshire","NH"},{"New Jersey","NJ"},{"New Mexico","NM"},{"New York","NY"},
+            {"North Carolina","NC"},{"North Dakota","ND"},{"Ohio","OH"},{"Oklahoma","OK"},
+            {"Oregon","OR"},{"Pennsylvania","PA"},{"Rhode Island","RI"},{"South Carolina","SC"},
+            {"South Dakota","SD"},{"Tennessee","TN"},{"Texas","TX"},{"Utah","UT"},
+            {"Vermont","VT"},{"Virginia","VA"},{"Washington","WA"},{"West Virginia","WV"},
+            {"Wisconsin","WI"},{"Wyoming","WY"}
+        };
+        for (String[] s : states) {
+            if (s[0].equalsIgnoreCase(token)) return s[1];
+        }
+        return null;
+    }
+
+    /**
+     * Extract a city name from an address segment, stripping PO Box prefixes
+     * and suite numbers. E.g. "PO BOX 51138. Midland" → "Midland".
+     */
+    private static String extractCityFromSegment(String seg) {
+        String s = seg.trim();
+        // Strip PO Box / Drawer prefix
+        s = s.replaceAll("(?i)^p\\.?\\s*o\\.?\\s*box\\s+\\S+\\s*,?\\s*", "");
+        s = s.replaceAll("(?i)^p\\.?\\s*o\\.?\\s+drawer\\s+\\S+\\s*,?\\s*", "");
+        s = s.trim();
+        // If what remains still has a leading address (e.g. "105 N HUDSON AVE STE 800 Oklahoma City"),
+        // grab the last run of Title-Case words at the end
+        java.util.regex.Matcher m = java.util.regex.Pattern
+                .compile("([A-Z][a-z]+(?:\\s[A-Z][a-z]+)*)$")
+                .matcher(s);
+        if (m.find()) return m.group(1).trim();
+        return s;
+    }
     /**
      * Parse a combined "City, ST ZIP" or "City, ST" cell into [city, state].
      * Examples:

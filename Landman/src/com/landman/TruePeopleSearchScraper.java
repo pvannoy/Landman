@@ -133,7 +133,10 @@ public class TruePeopleSearchScraper {
         System.out.println("  Python : " + PYTHON_EXE + (PYTHON_EXE.equals("python") || PYTHON_EXE.equals("python3") || PYTHON_EXE.equals("py") ? " (from PATH)" : ""));
         System.out.println("  Script : " + SCRAPER_PY_PATH);
 
-        if (!new File(PYTHON_EXE).exists()) {
+        // Only check file existence for absolute paths — PATH commands like
+        // "python" or "python3" are not file paths and don't need this check
+        boolean isAbsolutePath = PYTHON_EXE.contains("\\") || PYTHON_EXE.contains("/");
+        if (isAbsolutePath && !new File(PYTHON_EXE).exists()) {
             throw new RuntimeException(
                     "Python executable not found at: " + PYTHON_EXE
                     + "\nUpdate PYTHON_EXE in TruePeopleSearchScraper.java.");
