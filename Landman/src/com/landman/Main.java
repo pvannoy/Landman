@@ -107,6 +107,11 @@ public class Main {
 
             Sheet sheet = workbook.getSheetAt(0);
 
+            // ── Cell style for Phone/Email cells — wrap text, top-aligned ────
+            CellStyle wrapStyle = workbook.createCellStyle();
+            wrapStyle.setWrapText(true);
+            wrapStyle.setVerticalAlignment(VerticalAlignment.TOP);
+
             // ── Locate the header row by scanning for known column names ─────
             Row headerRow = null;
             int nameCol = -1, cityCol = -1, stCol = -1, cityStZipCol = -1, fullAddressCol = -1;
@@ -184,14 +189,14 @@ public class Main {
 
                 String name = getCellString(row.getCell(nameCol));
                 String city, state;
-                if (fullAddressCol != -1) {
-                    // Parse city/state from full address "123 Main St, Oklahoma City, OK 73107"
-                    String[] parsed = parseFullAddress(getCellString(row.getCell(fullAddressCol)));
-                    city  = parsed[0];
-                    state = parsed[1];
-                } else if (cityStZipCol != -1) {
+                if (cityStZipCol != -1) {
                     // Parse "City, ST ZIP" or "City, ST" from combined column
                     String[] parsed = parseCityStateZip(getCellString(row.getCell(cityStZipCol)));
+                    city  = parsed[0];
+                    state = parsed[1];
+                } else if (fullAddressCol != -1) {
+                    // Parse city/state from full address "123 Main St, Oklahoma City, OK 73107"
+                    String[] parsed = parseFullAddress(getCellString(row.getCell(fullAddressCol)));
                     city  = parsed[0];
                     state = parsed[1];
                 } else {
@@ -230,14 +235,16 @@ public class Main {
                         System.out.println("IP ban could not be resolved. Saving progress and exiting.");
                         ipBanned = true;
                         break;
-                    } catch (org.openqa.selenium.WebDriverException browserEx) {
-                        System.out.println("Browser died (attempt " + attempts + "): " + browserEx.getMessage().split("\n")[0]);
+                    } catch (RuntimeException browserEx) {
+                        // Handles subprocess/browser crashes
+                        String msg = browserEx.getMessage() != null ? browserEx.getMessage().split("\n")[0] : "unknown error";
+                        System.out.println("Browser/subprocess error (attempt " + attempts + "): " + msg);
                         if (attempts < 2) {
-                            System.out.println("Restarting browser and retrying row...");
+                            System.out.println("Restarting scraper and retrying row...");
                             TruePeopleSearchScraper.restartDriver();
                             Thread.sleep(3000);
                         } else {
-                            System.out.println("Skipping row after browser failed twice.");
+                            System.out.println("Skipping row after scraper failed twice.");
                             contact = new TruePeopleSearchScraper.PersonContact();
                         }
                     }
@@ -261,8 +268,13 @@ public class Main {
                 String phonesStr = String.join("\n", contact.phones);
                 String emailsStr = String.join("\n", contact.emails);
 
-                getOrCreateCell(row, phonesTpsCol).setCellValue(phonesStr);
-                getOrCreateCell(row, emailsTpsCol).setCellValue(emailsStr);
+                Cell phoneCell = getOrCreateCell(row, phonesTpsCol);
+                phoneCell.setCellValue(phonesStr);
+                phoneCell.setCellStyle(wrapStyle);
+
+                Cell emailCell = getOrCreateCell(row, emailsTpsCol);
+                emailCell.setCellValue(emailsStr);
+                emailCell.setCellStyle(wrapStyle);
 
                 System.out.println("Found phones(tps): " + contact.phones);
                 System.out.println("Found emails(tps): " + contact.emails);
@@ -280,6 +292,13 @@ public class Main {
                 Thread.sleep(actualDelay * 1000L);
                 System.out.println("--------------------");
             }
+
+            // ── Auto-size Phone and Email columns before final save ──────────
+            // Use a fixed width wide enough for a phone number / email address.
+            // autoSizeColumn() is slow and unreliable with wrapped multi-line cells,
+            // so we set a sensible fixed width instead (units are 1/256th of a char).
+            sheet.setColumnWidth(phonesTpsCol, 18 * 256);  // ~18 chars = (405) 947-4673
+            sheet.setColumnWidth(emailsTpsCol, 35 * 256);  // ~35 chars for a typical email
 
             // ── Write output ─────────────────────────────────────────────────
             try (FileOutputStream fos = new FileOutputStream(outputPath)) {
@@ -413,9 +432,9 @@ public class Main {
         s = s.replaceAll("(?i)^p\\.?\\s*o\\.?\\s+drawer\\s+\\S+\\s*,?\\s*", "");
         s = s.trim();
         // If what remains still has a leading address (e.g. "105 N HUDSON AVE STE 800 Oklahoma City"),
-        // grab the last run of Title-Case words at the end
+        // grab the last run of capitalized words — handles Mc/Mac prefixes and mixed case
         java.util.regex.Matcher m = java.util.regex.Pattern
-                .compile("([A-Z][a-z]+(?:\\s[A-Z][a-z]+)*)$")
+                .compile("([A-Z][A-Za-z]+(?:\\s[A-Z][A-Za-z]+)*)$")
                 .matcher(s);
         if (m.find()) return m.group(1).trim();
         return s;
