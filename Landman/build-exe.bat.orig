@@ -1,0 +1,221 @@
+@echo off
+<<<<<<< HEAD
+setlocal
+
+REM ============================================================
+REM  build-exe.bat — Builds Landman.exe
+REM
+REM  Requirements:
+REM    - Java 21+ on PATH
+REM    - Launch4j installed (https://launch4j.sourceforge.net)
+REM    - Landman.jar already built from Eclipse:
+REM        Right-click project > Run As > Maven build... > clean package
+REM ============================================================
+
+set PROJECT_DIR=%~dp0
+cd /d "%PROJECT_DIR%"
+
+echo ============================================================
+echo  Landman EXE Builder
+echo  Project: %PROJECT_DIR%
+echo ============================================================
+echo.
+
+REM ── Step 1: Verify jar exists ────────────────────────────────
+echo [1/2] Checking for fat jar...
+
+if exist "target\Landman.jar" (
+    echo       Found: target\Landman.jar
+    goto :step2
+)
+
+REM Jar missing — try Maven if available
+echo       target\Landman.jar not found. Trying Maven...
+set MVN_CMD=
+where mvn >nul 2>&1 && set MVN_CMD=mvn
+
+if "%MVN_CMD%"=="" (
+    for /f "delims=" %%i in ('where eclipse 2^>nul') do set ECLIPSE_DIR=%%~dpi
+    if defined ECLIPSE_DIR (
+        for /r "%ECLIPSE_DIR%" %%f in (mvn.cmd) do (
+            if "%MVN_CMD%"=="" set MVN_CMD=%%f
+        )
+    )
+)
+
+if "%MVN_CMD%"=="" (
+    echo.
+    echo ERROR: target\Landman.jar not found and Maven is not available.
+    echo.
+    echo Build the jar from Eclipse first:
+    echo   Right-click Landman project
+    echo   ^> Run As ^> Maven build...
+    echo   ^> Goals: clean package
+    echo   ^> Click Run
+    echo.
+    echo Then double-click build-exe.bat again.
+    pause
+    exit /b 1
+)
+
+call "%MVN_CMD%" clean package -q
+if errorlevel 1 (
+    echo ERROR: Maven build failed.
+    pause
+    exit /b 1
+)
+
+if not exist "target\Landman.jar" (
+    echo ERROR: Jar still not found. Check pom.xml includes maven-shade-plugin.
+    pause
+    exit /b 1
+)
+
+:step2
+REM ── Step 2: Wrap with Launch4j ───────────────────────────────
+echo [2/2] Wrapping jar into EXE with Launch4j...
+
+set L4J_CMD=
+if exist "C:\Program Files\Launch4j\launch4jc.exe"     set L4J_CMD=C:\Program Files\Launch4j\launch4jc.exe
+if "%L4J_CMD%"=="" if exist "C:\Program Files (x86)\Launch4j\launch4jc.exe" set L4J_CMD=C:\Program Files (x86)\Launch4j\launch4jc.exe
+
+if "%L4J_CMD%"=="" (
+    echo ERROR: Launch4j not found. Install from: https://launch4j.sourceforge.net
+    pause
+    exit /b 1
+)
+
+set L4J_CFG=%TEMP%\landman-launch4j.xml
+(
+echo ^<?xml version="1.0" encoding="UTF-8"?^>
+echo ^<launch4jConfig^>
+echo   ^<dontWrapJar^>false^</dontWrapJar^>
+echo   ^<headerType^>console^</headerType^>
+echo   ^<jar^>%PROJECT_DIR%target\Landman.jar^</jar^>
+echo   ^<outfile^>%PROJECT_DIR%Landman.exe^</outfile^>
+echo   ^<errTitle^>Landman Error^</errTitle^>
+echo   ^<cmdLine^>^</cmdLine^>
+echo   ^<chdir^>.^</chdir^>
+echo   ^<priority^>normal^</priority^>
+echo   ^<downloadUrl^>https://adoptium.net^</downloadUrl^>
+echo   ^<supportUrl^>^</supportUrl^>
+echo   ^<stayAlive^>false^</stayAlive^>
+echo   ^<restartOnCrash^>false^</restartOnCrash^>
+echo   ^<manifest^>^</manifest^>
+echo   ^<jre^>
+echo     ^<path^>^</path^>
+echo     ^<bundledJre64Bit^>false^</bundledJre64Bit^>
+echo     ^<bundledJreAsFallback^>false^</bundledJreAsFallback^>
+echo     ^<minVersion^>21^</minVersion^>
+echo     ^<maxVersion^>^</maxVersion^>
+echo     ^<jdkPreference^>preferJre^</jdkPreference^>
+echo     ^<runtimeBits^>64/32^</runtimeBits^>
+echo   ^</jre^>
+echo ^</launch4jConfig^>
+) > "%L4J_CFG%"
+
+"%L4J_CMD%" "%L4J_CFG%"
+del "%L4J_CFG%"
+
+if not exist "Landman.exe" (
+    echo ERROR: Landman.exe was not created. Check Launch4j output above.
+    pause
+    exit /b 1
+)
+
+echo.
+echo ============================================================
+echo  SUCCESS: Landman.exe created in:
+echo  %PROJECT_DIR%Landman.exe
+echo.
+echo  NOTE: scraper.py must be in the same folder as Landman.exe
+echo ============================================================
+echo.
+pause
+=======
+REM ============================================================
+REM  Build Landman as a Windows .exe using jpackage (JDK 21+)
+REM ============================================================
+REM
+REM  Prerequisites:
+REM    - JDK 21+ installed and JAVA_HOME set (jpackage is included)
+REM    - Maven is NOT required — the included Maven wrapper (mvnw) is used
+REM
+REM  Usage:
+REM    build-exe.bat
+REM
+REM  Output:
+REM    dist\Landman\        — standalone app folder with Landman.exe
+REM    (scraper.py and chromedriver are copied into the folder automatically)
+REM ============================================================
+
+setlocal
+
+set APP_NAME=Landman
+set APP_VERSION=0.4.0
+set MAIN_CLASS=com.landman.Main
+set MAIN_JAR=Landman-%APP_VERSION%.jar
+
+REM ── Verify JAVA_HOME ──
+if "%JAVA_HOME%"=="" (
+    echo [ERROR] JAVA_HOME is not set. Please set it to your JDK 21+ installation.
+    exit /b 1
+)
+echo Using JAVA_HOME: %JAVA_HOME%
+
+echo.
+echo ===== Step 1: Build fat JAR with Maven =====
+call mvnw.cmd clean package -q
+if errorlevel 1 (
+    echo [ERROR] Maven build failed.
+    exit /b 1
+)
+echo Fat JAR built: target\%MAIN_JAR%
+
+echo.
+echo ===== Step 2: Create app image with jpackage =====
+REM Remove old output if present
+if exist dist\%APP_NAME% rmdir /s /q dist\%APP_NAME%
+
+"%JAVA_HOME%\bin\jpackage.exe" ^
+  --type app-image ^
+  --name %APP_NAME% ^
+  --input target ^
+  --main-jar %MAIN_JAR% ^
+  --main-class %MAIN_CLASS% ^
+  --dest dist ^
+  --java-options "-Xmx512m" ^
+  --win-console
+
+if errorlevel 1 (
+    echo [ERROR] jpackage failed.
+    exit /b 1
+)
+
+echo App image created at: dist\%APP_NAME%\
+
+echo.
+echo ===== Step 3: Bundle scraper.py and chromedriver =====
+REM Copy scraper.py next to the exe so TruePeopleSearchScraper can find it
+copy /y scraper.py "dist\%APP_NAME%\scraper.py" >nul
+
+REM Copy chromedriver directory
+if exist chromedriver_win32 (
+    xcopy /e /i /y chromedriver_win32 "dist\%APP_NAME%\chromedriver_win32" >nul
+)
+
+echo.
+echo ===== Build complete! =====
+echo.
+echo Distributable folder:  dist\%APP_NAME%\
+echo Executable:            dist\%APP_NAME%\%APP_NAME%.exe
+echo.
+echo To distribute, zip the entire dist\%APP_NAME% folder.
+echo The end user does NOT need Java installed — the JRE is bundled.
+echo The end user DOES need Python + undetected-chromedriver installed
+echo (for scraper.py).
+echo.
+
+endlocal
+
+>>>>>>> 434a77887b37078ab9c1dbb69e524cc59a412088
