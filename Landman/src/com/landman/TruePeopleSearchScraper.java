@@ -289,24 +289,33 @@ public class TruePeopleSearchScraper {
 
     private static String resolvePyPath() {
         // Search for scraper.py in several likely locations:
-        // 1. Same directory as the running jar (target/)
+        // 1. Same directory as the running jar / jpackage app dir
         // 2. Parent of jar directory (project root)
-        // 3. src/ folder next to target/
-        // 4. Current working directory
+        // 3. jpackage app-image root (app/ → parent is the exe's folder)
+        // 4. src/ folder next to target/
+        // 5. Current working directory
         try {
             String jarDir = new File(
                     TruePeopleSearchScraper.class.getProtectionDomain()
                     .getCodeSource().getLocation().toURI()).getParent();
             for (String candidate : new String[]{
-                    jarDir + "\\scraper.py",
-                    jarDir + "\\..\\scraper.py",
-                    jarDir + "\\..\\src\\scraper.py",
+                    jarDir + File.separator + "scraper.py",
+                    jarDir + File.separator + ".." + File.separator + "scraper.py",
+                    jarDir + File.separator + ".." + File.separator + ".." + File.separator + "scraper.py",
+                    jarDir + File.separator + ".." + File.separator + "src" + File.separator + "scraper.py",
                     "scraper.py"
             }) {
                 File f = new File(candidate);
                 if (f.exists()) return f.getAbsolutePath();
             }
         } catch (Exception ignored) {}
+        // Also check the directory where the .exe / launch script lives
+        String appHome = System.getProperty("jpackage.app-path");
+        if (appHome != null) {
+            File exeDir = new File(appHome).getParentFile();
+            File f = new File(exeDir, "scraper.py");
+            if (f.exists()) return f.getAbsolutePath();
+        }
         return "scraper.py"; // final fallback
     }
 

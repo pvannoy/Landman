@@ -1,3 +1,15 @@
 /Landman/bin
 /Landman/target
 /.idea
+# Build output
+target/
+dist/
+
+# IDE
+.idea/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+
