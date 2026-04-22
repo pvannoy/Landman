@@ -3,7 +3,7 @@ TruePeopleSearch scraper using undetected-chromedriver.
 Launched as a subprocess by TruePeopleSearchScraper.java.
 
 Protocol (stdin/stdout, one JSON object per line):
-  Input:  {"name": "John Smith", "city": "Edmond", "state": "OK"}
+  Input:  {"name": "John Smith", "street": "123 Main St", "city": "Edmond", "state": "OK", "zipcode": "73034"}
   Output: {"phones": ["(405) 123-4567"], "emails": ["john@example.com"], "error": null}
   Quit:   {"quit": true}
 """
@@ -14,7 +14,7 @@ import time
 import re
 import os
 
-SCRAPER_VERSION = "2.7"  # Updated: check success before restriction
+SCRAPER_VERSION = "2.9"  # Auto-restart Chrome on connection errors
 print(f"[scraper] version {SCRAPER_VERSION}", file=__import__("sys").stderr, flush=True)
 
 # Suppress noisy logs from selenium/urllib3
@@ -256,11 +256,22 @@ def safe_get(driver, url):
     Navigate to a URL, catching page load timeouts gracefully.
     undetected_chromedriver can hang on driver.get() if the page load timeout
     is exceeded — this wrapper catches the TimeoutException so execution continues.
+    Any ChromeDriver connection errors are re-raised so the main loop can
+    restart the browser.
     """
     try:
         driver.get(url)
     except Exception as e:
-        if "timeout" in str(e).lower() or "TimeoutException" in type(e).__name__:
+        err_str = str(e)
+        # Re-raise connection / session errors — browser needs a restart
+        if any(s in err_str for s in [
+            "ConnectionResetError", "Connection aborted",
+            "No connection could be made", "NewConnectionError",
+            "Failed to establish", "Max retries exceeded",
+            "chrome not reachable", "session deleted", "invalid session",
+        ]):
+            raise
+        if "timeout" in err_str.lower() or "TimeoutException" in type(e).__name__:
             print(f"[scraper] page load timeout for {url} — continuing anyway",
                   file=sys.stderr, flush=True)
         else:
@@ -293,45 +304,87 @@ def clean_name(raw):
         name = name.split("&")[0].strip()
     return name
 
-# ── Main search function ──────────────────────────────────────────────────────
+# ── Name matching helpers ─────────────────────────────────────────────────────
 
-def search(driver, name, city, state):
-    search_name = clean_name(name)
-    if not search_name:
-        return {"phones": [], "emails": [], "error": "Could not extract usable name"}
+def name_tokens(raw):
+    """Return a set of lowercase word tokens from a name string."""
+    if not raw:
+        return set()
+    # Strip punctuation except apostrophes, lowercase
+    cleaned = re.sub(r"[^a-zA-Z' ]", " ", raw).lower()
+    return {t for t in cleaned.split() if len(t) > 1}
 
-    query = f"name={pct_encode(search_name)}&citystatezip={pct_encode(city + ', ' + state)}"
-    results_url = f"https://www.truepeoplesearch.com/results?{query}"
+def card_matches_name(card_html, target_name):
+    """
+    Return a match score (0–3) for how well a result card matches target_name.
+      3 = full name found in card heading
+      2 = first + last name both present (possibly in related/AKA names)
+      1 = last name present
+      0 = no match
+    """
+    target_tokens = name_tokens(clean_name(target_name))
+    if not target_tokens:
+        return 0
 
-    safe_get(driver, results_url)
-    time.sleep(5)  # initial render pause — wait for page to fully load
+    card_lower = card_html.lower()
 
-    if not wait_for_results(driver, results_url):
-        return {"phones": [], "emails": [], "error": "Results page did not load"}
+    # Grab the card heading name (primary name shown large)
+    heading_match = re.search(r'<span[^>]*card-name[^>]*>([^<]+)</span>', card_html, re.IGNORECASE)
+    if not heading_match:
+        # Try data-detail-link text or any h2/h3
+        heading_match = re.search(r'<(?:h2|h3)[^>]*>([^<]+)</(?:h2|h3)>', card_html, re.IGNORECASE)
+    heading_tokens = name_tokens(heading_match.group(1)) if heading_match else set()
 
-    # Get first result's detail link
-    src = page_html(driver)
-    if not src or "data-detail-link" not in src:
-        return {"phones": [], "emails": [], "error": "No results found"}
+    # Full name in heading
+    if target_tokens and target_tokens <= heading_tokens:
+        return 3
 
-    # Extract detail link directly from HTML — avoids WebDriver connection timeout
-    m = re.search(r'data-detail-link="(/find/person/[^"]+)"', src)
-    if not m:
-        return {"phones": [], "emails": [], "error": "No result cards found"}
-    detail_path = m.group(1)
+    # Collect all text in the card (heading + AKA / related names section)
+    all_text_tokens = name_tokens(card_html)
 
-    detail_url = "https://www.truepeoplesearch.com" + detail_path
+    # First name + last name both somewhere in the card
+    if len(target_tokens) >= 2 and target_tokens <= all_text_tokens:
+        return 2
+
+    # At least the last token (likely last name) matches
+    last_token = list(target_tokens)[-1] if target_tokens else None
+    if last_token and last_token in all_text_tokens:
+        return 1
+
+    return 0
+
+
+def extract_cards(src):
+    """
+    Split the results page HTML into individual result card HTML chunks.
+    Each card is bounded by a data-detail-link attribute.
+    Returns list of (detail_path, card_html) tuples.
+    """
+    cards = []
+    for m in re.finditer(r'data-detail-link="(/find/person/[^"]+)"', src):
+        start = src.rfind("<div", 0, m.start())
+        # Find a reasonable end — next data-detail-link anchor or end of src
+        next_card = src.find('data-detail-link="', m.end())
+        end = src.rfind("</div>", m.start(), next_card) + 6 if next_card > 0 else m.end() + 2000
+        card_html = src[start:end]
+        cards.append((m.group(1), card_html))
+    return cards
+
+
+# ── Scraping detail page ──────────────────────────────────────────────────────
+
+def scrape_detail(driver, detail_url):
+    """Navigate to a detail page and return phones + emails."""
     print(f"[scraper] navigating to detail: {detail_url}", file=sys.stderr, flush=True)
     safe_get(driver, detail_url)
-    time.sleep(5)  # detail page render pause
+    time.sleep(5)
     print(f"[scraper] calling wait_for_detail", file=sys.stderr, flush=True)
 
     if not wait_for_detail(driver, detail_url):
-        return {"phones": [], "emails": [], "error": "Detail page did not load"}
+        return None, None  # failed
 
     html = page_html(driver) or ""
-
-    phones = list(dict.fromkeys(PHONE_RE.findall(html)))  # deduplicated, order preserved
+    phones = list(dict.fromkeys(PHONE_RE.findall(html)))
 
     emails = []
     seen = set()
@@ -346,6 +399,93 @@ def search(driver, name, city, state):
         if any(d in e for d in EMAIL_NOISE_DOMAINS):
             continue
         emails.append(e)
+
+    return phones, emails
+
+
+# ── Main search function ──────────────────────────────────────────────────────
+
+def search(driver, name, street, city, state, zipcode):
+    """
+    Search strategy:
+      1. If street address is available, search by address and pick the card
+         whose name best matches target name (or AKA/related names).
+         Fall back to first card if no name match found.
+      2. If no street, fall back to name+city+state search (original behavior).
+    """
+    search_name = clean_name(name)
+    if not search_name:
+        return {"phones": [], "emails": [], "error": "Could not extract usable name"}
+
+    # ── Address search path ────────────────────────────────────────────────────
+    if street and street.strip():
+        # Build city+state+zip string (zip optional)
+        citystatezip = city.strip()
+        if state:
+            citystatezip += ", " + state.strip()
+        if zipcode and zipcode.strip():
+            citystatezip += " " + zipcode.strip()
+
+        addr_query = (f"streetaddress={pct_encode(street.strip())}"
+                      f"&citystatezip={pct_encode(citystatezip)}")
+        results_url = f"https://www.truepeoplesearch.com/resultaddress?{addr_query}"
+        print(f"[scraper] address search: {results_url}", file=sys.stderr, flush=True)
+
+        safe_get(driver, results_url)
+        time.sleep(5)
+
+        if wait_for_results(driver, results_url):
+            src = page_html(driver) or ""
+            if "data-detail-link" in src:
+                cards = extract_cards(src)
+                print(f"[scraper] address search found {len(cards)} card(s)", file=sys.stderr, flush=True)
+
+                # Score each card against the target name
+                best_path = None
+                best_score = -1
+                for detail_path, card_html in cards:
+                    score = card_matches_name(card_html, name)
+                    print(f"[scraper]   card score={score} path={detail_path}", file=sys.stderr, flush=True)
+                    if score > best_score:
+                        best_score = score
+                        best_path = detail_path
+
+                if best_path:
+                    if best_score == 0:
+                        print(f"[scraper] no name match — using first card", file=sys.stderr, flush=True)
+                    else:
+                        print(f"[scraper] best match score={best_score}", file=sys.stderr, flush=True)
+                    detail_url = "https://www.truepeoplesearch.com" + best_path
+                    phones, emails = scrape_detail(driver, detail_url)
+                    if phones is not None:
+                        return {"phones": phones, "emails": emails, "error": None}
+
+        # Address search failed or no results — fall through to name search
+        print(f"[scraper] address search yielded nothing, falling back to name search",
+              file=sys.stderr, flush=True)
+
+    # ── Name + city/state search (original fallback) ───────────────────────────
+    query = f"name={pct_encode(search_name)}&citystatezip={pct_encode(city + ', ' + state)}"
+    results_url = f"https://www.truepeoplesearch.com/results?{query}"
+
+    safe_get(driver, results_url)
+    time.sleep(5)
+
+    if not wait_for_results(driver, results_url):
+        return {"phones": [], "emails": [], "error": "Results page did not load"}
+
+    src = page_html(driver)
+    if not src or "data-detail-link" not in src:
+        return {"phones": [], "emails": [], "error": "No results found"}
+
+    m = re.search(r'data-detail-link="(/find/person/[^"]+)"', src)
+    if not m:
+        return {"phones": [], "emails": [], "error": "No result cards found"}
+
+    detail_url = "https://www.truepeoplesearch.com" + m.group(1)
+    phones, emails = scrape_detail(driver, detail_url)
+    if phones is None:
+        return {"phones": [], "emails": [], "error": "Detail page did not load"}
 
     return {"phones": phones, "emails": emails, "error": None}
 
@@ -371,14 +511,42 @@ def main():
             if req.get("quit"):
                 break
 
-            name  = req.get("name", "")
-            city  = req.get("city", "")
-            state = req.get("state", "")
+            name    = req.get("name", "")
+            street  = req.get("street", "")
+            city    = req.get("city", "")
+            state   = req.get("state", "")
+            zipcode = req.get("zipcode", "")
 
-            try:
-                result = search(driver, name, city, state)
-            except Exception as ex:
-                result = {"phones": [], "emails": [], "error": str(ex)}
+            # Attempt the search; on any ChromeDriver / connection error, restart
+            # Chrome once and retry before giving up.
+            for attempt in range(2):
+                try:
+                    result = search(driver, name, street, city, state, zipcode)
+                    break
+                except Exception as ex:
+                    err_str = str(ex)
+                    is_browser_error = any(s in err_str for s in [
+                        "ConnectionResetError", "Connection aborted",
+                        "No connection could be made", "NewConnectionError",
+                        "Failed to establish", "Max retries exceeded",
+                        "WebDriverException", "chrome not reachable",
+                        "session deleted", "invalid session",
+                    ])
+                    if is_browser_error and attempt == 0:
+                        print(f"[scraper] Chrome connection lost ({err_str[:80]}) — restarting browser...",
+                              file=sys.stderr, flush=True)
+                        try:
+                            driver.quit()
+                        except Exception:
+                            pass
+                        time.sleep(5)
+                        driver = make_driver()
+                        print(f"[scraper] Chrome restarted — retrying search",
+                              file=sys.stderr, flush=True)
+                        continue
+                    # Non-browser error or second attempt — return the error
+                    result = {"phones": [], "emails": [], "error": err_str}
+                    break
 
             print(json.dumps(result), flush=True)
 

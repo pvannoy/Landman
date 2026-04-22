@@ -13,7 +13,7 @@ import java.util.regex.*;
  * detection that blocks standard Selenium.
  *
  * Protocol between Java and Python:
- *   Java → Python (stdin):  {"name":"...", "city":"...", "state":"..."}\n
+ *   Java → Python (stdin):  {"name":"...", "street":"...", "city":"...", "state":"...", "zipcode":"..."}\n
  *   Python → Java (stdout): {"phones":[...], "emails":[...], "error":null}\n
  *   Python → Java (stdout): {"prompt":"CAPTCHA_REQUIRED"}\n  (user action needed)
  *   Java → Python (stdin):  {"quit":true}\n  (on shutdown)
@@ -204,15 +204,15 @@ public class TruePeopleSearchScraper {
 
     // ── Public API ────────────────────────────────────────────────────────────
 
-    public static PersonContact search(String name, String city, String state)
+    public static PersonContact search(String name, String street, String city, String state, String zipcode)
             throws Exception, IpBanException {
 
         ensureStarted();
 
         // Build JSON request
         String req = String.format(
-                "{\"name\":%s,\"city\":%s,\"state\":%s}\n",
-                jsonStr(name), jsonStr(city), jsonStr(state));
+                "{\"name\":%s,\"street\":%s,\"city\":%s,\"state\":%s,\"zipcode\":%s}\n",
+                jsonStr(name), jsonStr(street), jsonStr(city), jsonStr(state), jsonStr(zipcode));
 
         synchronized (TruePeopleSearchScraper.class) {
             pyIn.write(req);
@@ -289,33 +289,24 @@ public class TruePeopleSearchScraper {
 
     private static String resolvePyPath() {
         // Search for scraper.py in several likely locations:
-        // 1. Same directory as the running jar / jpackage app dir
+        // 1. Same directory as the running jar (target/)
         // 2. Parent of jar directory (project root)
-        // 3. jpackage app-image root (app/ → parent is the exe's folder)
-        // 4. src/ folder next to target/
-        // 5. Current working directory
+        // 3. src/ folder next to target/
+        // 4. Current working directory
         try {
             String jarDir = new File(
                     TruePeopleSearchScraper.class.getProtectionDomain()
                     .getCodeSource().getLocation().toURI()).getParent();
             for (String candidate : new String[]{
-                    jarDir + File.separator + "scraper.py",
-                    jarDir + File.separator + ".." + File.separator + "scraper.py",
-                    jarDir + File.separator + ".." + File.separator + ".." + File.separator + "scraper.py",
-                    jarDir + File.separator + ".." + File.separator + "src" + File.separator + "scraper.py",
+                    jarDir + "\\scraper.py",
+                    jarDir + "\\..\\scraper.py",
+                    jarDir + "\\..\\src\\scraper.py",
                     "scraper.py"
             }) {
                 File f = new File(candidate);
                 if (f.exists()) return f.getAbsolutePath();
             }
         } catch (Exception ignored) {}
-        // Also check the directory where the .exe / launch script lives
-        String appHome = System.getProperty("jpackage.app-path");
-        if (appHome != null) {
-            File exeDir = new File(appHome).getParentFile();
-            File f = new File(exeDir, "scraper.py");
-            if (f.exists()) return f.getAbsolutePath();
-        }
         return "scraper.py"; // final fallback
     }
 
